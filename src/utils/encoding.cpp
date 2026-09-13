@@ -1,276 +1,278 @@
 #include "utils/encoding.hpp"
 
 #include <algorithm>
-#include <cctype>
-#include <vector>
+#include <limits>
 
 #ifdef _WIN32
 #include <windows.h>
-#else
-#include <iconv.h>
-#include <cerrno>
-#include <cstring>
 #endif
 
 namespace project_describer {
+namespace {
 
-    // ============== 编码检测 ==============
-
-    TextEncoding EncodingUtils::detectEncoding(const std::vector<uint8_t>& data)
-    {
-        if (data.empty())
-        {
-            return TextEncoding::Unknown;
-        }
-
-        // 1. 检查 UTF-8 BOM
-        if (hasUtf8Bom(data))
-        {
-            return TextEncoding::UTF8_BOM;
-        }
-
-        // 2. 检查是否为纯 ASCII
-        if (isAscii(data))
-        {
-            return TextEncoding::ASCII;
-        }
-
-        // 3. 使用系统 API 检查是否为有效的 UTF-8（无 BOM）
-        std::string str(data.begin(), data.end());
-        if (isValidUtf8System(str))
-        {
-            return TextEncoding::UTF8;
-        }
-
-        // 4. 如果不是有效的 UTF-8，再尝试检测 GBK
-        if (isLikelyGbk(data))
-        {
-            return TextEncoding::GBK;
-        }
-
-        return TextEncoding::Unknown;
-    }
-
-    TextEncoding EncodingUtils::detectEncoding(const std::string& data)
-    {
-        std::vector<uint8_t> vec(data.begin(), data.end());
-        return detectEncoding(vec);
-    }
-
-    bool EncodingUtils::hasUtf8Bom(const std::vector<uint8_t>& data)
-    {
-        if (data.size() < 3) return false;
-        return data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF;
-    }
-
-    bool EncodingUtils::isAscii(const std::vector<uint8_t>& data)
-    {
-        return std::all_of(data.begin(), data.end(), [](uint8_t c)
-            {
-                return c <= 0x7F;
-            });
-    }
-
-    // ============== 使用系统 API 验证 UTF-8 ==============
-
-    bool EncodingUtils::isValidUtf8System(const std::string& str)
-    {
-        if (str.empty()) return true;
-
-#ifdef _WIN32
-        // Windows: 使用 MultiByteToWideChar 并指定 MB_ERR_INVALID_CHARS
-        int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str.c_str(), -1, nullptr, 0);
-        return (wide_len != 0);
-#else
-        // Linux: 使用 iconv 尝试转换
-        iconv_t cd = iconv_open("UTF-32LE", "UTF-8");
-        if (cd == (iconv_t)-1)
-        {
-            // 如果无法打开转换器，回退到简单的 UTF-8 检查
-            size_t i = 0;
-            while (i < str.size())
-            {
-                uint8_t c = static_cast<uint8_t>(str[i]);
-                size_t bytes = 0;
-                if ((c & 0x80) == 0)
-                {
-                    bytes = 1;
-                }
-                else if ((c & 0xE0) == 0xC0)
-                {
-                    bytes = 2;
-                }
-                else if ((c & 0xF0) == 0xE0)
-                {
-                    bytes = 3;
-                }
-                else if ((c & 0xF8) == 0xF0)
-                {
-                    bytes = 4;
-                }
-                else
-                {
-                    return false;
-                }
-                if (i + bytes > str.size()) return false;
-                for (size_t j = 1; j < bytes; ++j)
-                {
-                    if ((static_cast<uint8_t>(str[i + j]) & 0xC0) != 0x80)
-                    {
-                        return false;
-                    }
-                }
-                i += bytes;
-            }
-            return true;
-        }
-
-        char* in_buf = const_cast<char*>(str.c_str());
-        size_t in_bytes = str.size();
-        size_t out_bytes = in_bytes * 4;
-        std::vector<char> out_buf(out_bytes);
-        char* out_ptr = out_buf.data();
-
-        size_t result = iconv(cd, &in_buf, &in_bytes, &out_ptr, &out_bytes);
-        iconv_close(cd);
-
-        return (result != (size_t)-1);
-#endif
-    }
-
-    // ============== GBK 检测 ==============
-
-    bool EncodingUtils::isLikelyGbk(const std::vector<uint8_t>& data, double threshold)
-    {
-        size_t gbk_count = 0;
-        size_t total = data.size();
-
-        for (size_t i = 0; i < total; ++i)
-        {
-            uint8_t c = data[i];
-            if (c >= 0x81 && c <= 0xFE)
-            {
-                if (i + 1 < total)
-                {
-                    uint8_t c2 = data[i + 1];
-                    if ((c2 >= 0x40 && c2 <= 0x7E) || (c2 >= 0x80 && c2 <= 0xFE))
-                    {
-                        gbk_count++;
-                        i++; // 跳过第二个字节
-                    }
-                }
-            }
-        }
-
-        return (total > 0 && static_cast<double>(gbk_count) / total > threshold);
-    }
-
-    // ============== 编码转换 ==============
-
-    std::string EncodingUtils::stripBom(const std::string& utf8_str)
-    {
-        if (utf8_str.size() >= 3 &&
-            static_cast<uint8_t>(utf8_str[0]) == 0xEF &&
-            static_cast<uint8_t>(utf8_str[1]) == 0xBB &&
-            static_cast<uint8_t>(utf8_str[2]) == 0xBF)
-        {
-            return utf8_str.substr(3);
-        }
-        return utf8_str;
-    }
-
-#ifdef _WIN32
-    // Windows 平台：使用 MultiByteToWideChar / WideCharToMultiByte
-
-    std::string EncodingUtils::gbkToUtf8(const std::string& gbk_str)
-    {
-        if (gbk_str.empty()) return {};
-
-        // GBK -> UTF-16
-        int wide_len = MultiByteToWideChar(CP_ACP, 0, gbk_str.c_str(), -1, nullptr, 0);
-        if (wide_len <= 0) return gbk_str;
-
-        std::vector<wchar_t> wide_buf(wide_len);
-        MultiByteToWideChar(CP_ACP, 0, gbk_str.c_str(), -1, wide_buf.data(), wide_len);
-
-        // UTF-16 -> UTF-8
-        int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide_buf.data(), -1, nullptr, 0, nullptr, nullptr);
-        if (utf8_len <= 0) return gbk_str;
-
-        std::vector<char> utf8_buf(utf8_len);
-        WideCharToMultiByte(CP_UTF8, 0, wide_buf.data(), -1, utf8_buf.data(), utf8_len, nullptr, nullptr);
-
-        std::string result(utf8_buf.data());
-        return result;
-    }
-
-    std::string EncodingUtils::utf8ToGbk(const std::string& utf8_str)
-    {
-        if (utf8_str.empty()) return {};
-
-        // UTF-8 -> UTF-16
-        int wide_len = MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(), -1, nullptr, 0);
-        if (wide_len <= 0) return utf8_str;
-
-        std::vector<wchar_t> wide_buf(wide_len);
-        MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(), -1, wide_buf.data(), wide_len);
-
-        // UTF-16 -> GBK
-        int gbk_len = WideCharToMultiByte(CP_ACP, 0, wide_buf.data(), -1, nullptr, 0, nullptr, nullptr);
-        if (gbk_len <= 0) return utf8_str;
-
-        std::vector<char> gbk_buf(gbk_len);
-        WideCharToMultiByte(CP_ACP, 0, wide_buf.data(), -1, gbk_buf.data(), gbk_len, nullptr, nullptr);
-
-        std::string result(gbk_buf.data());
-        return result;
-    }
-
-#else
-    // Linux / macOS 平台：使用 iconv
-
-    std::string EncodingUtils::gbkToUtf8(const std::string& gbk_str)
-    {
-        if (gbk_str.empty()) return {};
-
-        iconv_t cd = iconv_open("UTF-8", "GBK");
-        if (cd == (iconv_t)-1) return gbk_str;
-
-        char* in_buf = const_cast<char*>(gbk_str.c_str());
-        size_t in_bytes = gbk_str.size();
-        size_t out_bytes = in_bytes * 4 + 1;
-        std::vector<char> out_buf(out_bytes);
-        char* out_ptr = out_buf.data();
-
-        size_t result = iconv(cd, &in_buf, &in_bytes, &out_ptr, &out_bytes);
-        iconv_close(cd);
-
-        if (result == (size_t)-1) return gbk_str;
-
-        return std::string(out_buf.data(), out_ptr - out_buf.data());
+bool StartsWith(const std::vector<std::uint8_t>& data,
+                const std::initializer_list<std::uint8_t> prefix) {
+    return data.size() >= prefix.size() &&
+           std::equal(prefix.begin(), prefix.end(), data.begin());
 }
 
-    std::string EncodingUtils::utf8ToGbk(const std::string& utf8_str)
-    {
-        if (utf8_str.empty()) return {};
+bool IsContinuation(const std::uint8_t byte) {
+    return (byte & 0xC0) == 0x80;
+}
 
-        iconv_t cd = iconv_open("GBK", "UTF-8");
-        if (cd == (iconv_t)-1) return utf8_str;
+bool IsValidUtf8(const std::vector<std::uint8_t>& data) {
+    for (std::size_t index = 0; index < data.size();) {
+        const std::uint8_t first = data[index];
+        if (first < 0x80) {
+            ++index;
+            continue;
+        }
 
-        char* in_buf = const_cast<char*>(utf8_str.c_str());
-        size_t in_bytes = utf8_str.size();
-        size_t out_bytes = in_bytes * 2 + 1;
-        std::vector<char> out_buf(out_bytes);
-        char* out_ptr = out_buf.data();
+        std::size_t length = 0;
+        std::uint32_t code_point = 0;
+        if ((first & 0xE0) == 0xC0) {
+            length = 2;
+            code_point = first & 0x1F;
+        } else if ((first & 0xF0) == 0xE0) {
+            length = 3;
+            code_point = first & 0x0F;
+        } else if ((first & 0xF8) == 0xF0) {
+            length = 4;
+            code_point = first & 0x07;
+        } else {
+            return false;
+        }
 
-        size_t result = iconv(cd, &in_buf, &in_bytes, &out_ptr, &out_bytes);
-        iconv_close(cd);
+        if (index + length > data.size()) {
+            return false;
+        }
+        for (std::size_t offset = 1; offset < length; ++offset) {
+            if (!IsContinuation(data[index + offset])) {
+                return false;
+            }
+            code_point = (code_point << 6) | (data[index + offset] & 0x3F);
+        }
 
-        if (result == (size_t)-1) return utf8_str;
-
-        return std::string(out_buf.data(), out_ptr - out_buf.data());
+        const std::uint32_t minimum = length == 2 ? 0x80 : length == 3 ? 0x800 : 0x10000;
+        if (code_point < minimum || code_point > 0x10FFFF ||
+            (code_point >= 0xD800 && code_point <= 0xDFFF)) {
+            return false;
+        }
+        index += length;
     }
 
+    return true;
+}
+
+void AppendUtf8(std::string& output, const std::uint32_t code_point) {
+    if (code_point <= 0x7F) {
+        output.push_back(static_cast<char>(code_point));
+    } else if (code_point <= 0x7FF) {
+        output.push_back(static_cast<char>(0xC0 | (code_point >> 6)));
+        output.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    } else if (code_point <= 0xFFFF) {
+        output.push_back(static_cast<char>(0xE0 | (code_point >> 12)));
+        output.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    } else {
+        output.push_back(static_cast<char>(0xF0 | (code_point >> 18)));
+        output.push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    }
+}
+
+std::optional<bool> DetectUtf16LittleEndian(const std::vector<std::uint8_t>& data) {
+    if (data.size() < 4 || data.size() % 2 != 0) {
+        return std::nullopt;
+    }
+
+    const std::size_t sample = std::min<std::size_t>(data.size(), 512);
+    std::size_t even_zeroes = 0;
+    std::size_t odd_zeroes = 0;
+    for (std::size_t index = 0; index < sample; index += 2) {
+        even_zeroes += data[index] == 0;
+        odd_zeroes += data[index + 1] == 0;
+    }
+
+    const std::size_t pairs = sample / 2;
+    if (odd_zeroes * 100 >= pairs * 35 && odd_zeroes > even_zeroes * 2) {
+        return true;
+    }
+    if (even_zeroes * 100 >= pairs * 35 && even_zeroes > odd_zeroes * 2) {
+        return false;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> DecodeUtf16(const std::vector<std::uint8_t>& data,
+                                        const std::size_t offset,
+                                        const bool little_endian) {
+    if ((data.size() - offset) % 2 != 0) {
+        return std::nullopt;
+    }
+
+    std::string output;
+    output.reserve(data.size());
+    for (std::size_t index = offset; index < data.size(); index += 2) {
+        const auto read_unit = [&](const std::size_t position) {
+            return little_endian
+                ? static_cast<std::uint16_t>(data[position] | (data[position + 1] << 8))
+                : static_cast<std::uint16_t>((data[position] << 8) | data[position + 1]);
+        };
+
+        std::uint32_t code_point = read_unit(index);
+        if (code_point >= 0xD800 && code_point <= 0xDBFF) {
+            if (index + 3 >= data.size()) {
+                return std::nullopt;
+            }
+            const std::uint32_t low = read_unit(index + 2);
+            if (low < 0xDC00 || low > 0xDFFF) {
+                return std::nullopt;
+            }
+            code_point = 0x10000 + ((code_point - 0xD800) << 10) + (low - 0xDC00);
+            index += 2;
+        } else if (code_point >= 0xDC00 && code_point <= 0xDFFF) {
+            return std::nullopt;
+        }
+        AppendUtf8(output, code_point);
+    }
+    return output;
+}
+
+std::optional<std::string> DecodeUtf32(const std::vector<std::uint8_t>& data,
+                                        const std::size_t offset,
+                                        const bool little_endian) {
+    if ((data.size() - offset) % 4 != 0) {
+        return std::nullopt;
+    }
+
+    std::string output;
+    output.reserve(data.size());
+    for (std::size_t index = offset; index < data.size(); index += 4) {
+        const std::uint32_t code_point = little_endian
+            ? static_cast<std::uint32_t>(data[index]) |
+                  (static_cast<std::uint32_t>(data[index + 1]) << 8) |
+                  (static_cast<std::uint32_t>(data[index + 2]) << 16) |
+                  (static_cast<std::uint32_t>(data[index + 3]) << 24)
+            : (static_cast<std::uint32_t>(data[index]) << 24) |
+                  (static_cast<std::uint32_t>(data[index + 1]) << 16) |
+                  (static_cast<std::uint32_t>(data[index + 2]) << 8) |
+                  static_cast<std::uint32_t>(data[index + 3]);
+        if (code_point > 0x10FFFF || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
+            return std::nullopt;
+        }
+        AppendUtf8(output, code_point);
+    }
+    return output;
+}
+
+#ifdef _WIN32
+std::optional<std::string> DecodeSystemAnsi(const std::vector<std::uint8_t>& data) {
+    if (data.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        return std::nullopt;
+    }
+
+    const int input_size = static_cast<int>(data.size());
+    const int wide_size = MultiByteToWideChar(GetACP(), MB_ERR_INVALID_CHARS,
+                                              reinterpret_cast<const char*>(data.data()),
+                                              input_size, nullptr, 0);
+    if (wide_size <= 0) {
+        return std::nullopt;
+    }
+    std::wstring wide(static_cast<std::size_t>(wide_size), L'\0');
+    if (MultiByteToWideChar(GetACP(), MB_ERR_INVALID_CHARS,
+                            reinterpret_cast<const char*>(data.data()), input_size,
+                            wide.data(), wide_size) <= 0) {
+        return std::nullopt;
+    }
+
+    const int utf8_size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                               wide.data(), wide_size, nullptr, 0,
+                                               nullptr, nullptr);
+    if (utf8_size <= 0) {
+        return std::nullopt;
+    }
+    std::string utf8(static_cast<std::size_t>(utf8_size), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), wide_size,
+                            utf8.data(), utf8_size, nullptr, nullptr) <= 0) {
+        return std::nullopt;
+    }
+    return utf8;
+}
 #endif
 
-} // namespace project_describer
+bool HasTooManyControlBytes(const std::vector<std::uint8_t>& data) {
+    const std::size_t controls = static_cast<std::size_t>(std::count_if(
+        data.begin(), data.end(), [](const std::uint8_t byte) {
+            return byte < 0x09 || (byte > 0x0D && byte < 0x20);
+        }));
+    return controls * 100 > data.size() * 4;
+}
+
+}  // namespace
+
+bool EncodingUtils::IsLikelyText(const std::vector<std::uint8_t>& data) {
+    if (data.empty()) {
+        return true;
+    }
+    if (StartsWith(data, {0xFF, 0xFE, 0x00, 0x00}) ||
+        StartsWith(data, {0x00, 0x00, 0xFE, 0xFF}) ||
+        StartsWith(data, {0xFF, 0xFE}) || StartsWith(data, {0xFE, 0xFF})) {
+        return true;
+    }
+    if (DetectUtf16LittleEndian(data).has_value()) {
+        return true;
+    }
+    if (std::find(data.begin(), data.end(), 0) != data.end()) {
+        return false;
+    }
+    return !HasTooManyControlBytes(data);
+}
+
+std::optional<DecodedText> EncodingUtils::DecodeToUtf8(const std::vector<std::uint8_t>& data) {
+    if (data.empty()) {
+        return DecodedText{TextEncoding::kUtf8, {}};
+    }
+    if (StartsWith(data, {0xFF, 0xFE, 0x00, 0x00})) {
+        const auto text = DecodeUtf32(data, 4, true);
+        return text ? std::optional<DecodedText>{{TextEncoding::kUtf32Le, *text}} : std::nullopt;
+    }
+    if (StartsWith(data, {0x00, 0x00, 0xFE, 0xFF})) {
+        const auto text = DecodeUtf32(data, 4, false);
+        return text ? std::optional<DecodedText>{{TextEncoding::kUtf32Be, *text}} : std::nullopt;
+    }
+    if (StartsWith(data, {0xFF, 0xFE})) {
+        const auto text = DecodeUtf16(data, 2, true);
+        return text ? std::optional<DecodedText>{{TextEncoding::kUtf16Le, *text}} : std::nullopt;
+    }
+    if (StartsWith(data, {0xFE, 0xFF})) {
+        const auto text = DecodeUtf16(data, 2, false);
+        return text ? std::optional<DecodedText>{{TextEncoding::kUtf16Be, *text}} : std::nullopt;
+    }
+    if (StartsWith(data, {0xEF, 0xBB, 0xBF})) {
+        std::vector<std::uint8_t> without_bom(data.begin() + 3, data.end());
+        if (!IsValidUtf8(without_bom)) {
+            return std::nullopt;
+        }
+        return DecodedText{TextEncoding::kUtf8Bom,
+                           std::string(without_bom.begin(), without_bom.end())};
+    }
+    if (const auto utf16_order = DetectUtf16LittleEndian(data)) {
+        const auto text = DecodeUtf16(data, 0, *utf16_order);
+        return text ? std::optional<DecodedText>{{*utf16_order ? TextEncoding::kUtf16Le : TextEncoding::kUtf16Be,
+                                                   *text}}
+                    : std::nullopt;
+    }
+    if (IsValidUtf8(data)) {
+        return DecodedText{TextEncoding::kUtf8, std::string(data.begin(), data.end())};
+    }
+#ifdef _WIN32
+    if (const auto ansi = DecodeSystemAnsi(data)) {
+        return DecodedText{TextEncoding::kSystemAnsi, *ansi};
+    }
+#endif
+    return std::nullopt;
+}
+
+}  // namespace project_describer

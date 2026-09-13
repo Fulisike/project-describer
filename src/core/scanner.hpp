@@ -1,59 +1,35 @@
 #pragma once
 
+#include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
-#include <filesystem>
-#include <functional>
 
 #include "model/file_item.hpp"
 
 namespace project_describer {
 
-    /**
-     * 目录扫描器
-     * 递归遍历目录，过滤出文本文件
-     */
-    class Scanner {
-    public:
-        /**
-         * 扫描结果
-         */
-        struct ScanResult {
-            std::vector<FileItem> files;   // 所有文本文件
-            size_t total_files = 0;        // 扫描到的总文件数
-            size_t text_files = 0;         // 文本文件数
-            std::vector<std::string> errors; // 错误信息
-        };
+struct ProjectEntry {
+    std::filesystem::path relative_path;
+    bool is_directory = false;
+};
 
-        /**
-         * 扫描目录
-         * @param root_path 项目根目录
-         * @param progress_callback 进度回调（可选），参数为当前文件路径
-         * @return ScanResult
-         */
-        static ScanResult scan(
-            const std::filesystem::path& root_path,
-            std::function<void(const std::string&)> progress_callback = nullptr
-        );
+struct ScanResult {
+    std::vector<ProjectEntry> entries;
+    std::vector<FileItem> text_files;
+    std::size_t scanned_files = 0;
+    std::vector<std::string> warnings;
+};
 
-    private:
-        /**
-         * 判断文件是否为文本文件（基于扩展名）
-         */
-        static bool isTextFile(const std::filesystem::path& path);
+struct ScannerConfig {
+    std::uintmax_t max_file_size = 1 * 1024 * 1024;  // 1 MiB default
+};
 
-        /**
-         * 获取文件相对于根目录的路径
-         */
-        static std::string getRelativePath(
-            const std::filesystem::path& root,
-            const std::filesystem::path& file
-        );
+class Scanner {
+public:
+    static ScanResult Scan(const std::filesystem::path& project_root,
+                           const std::filesystem::path& output_directory,
+                           const ScannerConfig& config = {});
+};
 
-        /**
-         * 文本文件扩展名列表
-         */
-        static const std::vector<std::string> TEXT_EXTENSIONS;
-    };
-
-} // namespace project_describer
+}  // namespace project_describer
