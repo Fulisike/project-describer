@@ -171,15 +171,17 @@ void MainWindow::OnStart() {
             const int adjusted_lines = file.content.empty() ? 0
                 : (file.content.back() == '\n' ? line_count : line_count + 1);
 
-            auto* path_item = new QStandardItem(
-                QString::fromStdString(file.relative_path.generic_string()));
+            const auto u8path = file.relative_path.generic_u8string();
+            auto* path_item = new QStandardItem(QString::fromUtf8(
+                reinterpret_cast<const char*>(u8path.data()),
+                static_cast<qsizetype>(u8path.size())));
+            path_item->setEditable(false);
+
             auto* lines_item = new QStandardItem(QString::number(adjusted_lines));
             lines_item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            lines_item->setEditable(false);
             auto* enc_item = new QStandardItem(
                 QString::fromStdString(std::string(EncodingName(file.source_encoding))));
-
-            path_item->setEditable(false);
-            lines_item->setEditable(false);
             enc_item->setEditable(false);
 
             tree_model_->appendRow({path_item, lines_item, enc_item});
