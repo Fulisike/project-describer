@@ -1,5 +1,6 @@
 #include "gui/main_window.hpp"
 
+#include <algorithm>
 #include <sstream>
 
 #include <QtCore/QDir>
@@ -11,7 +12,8 @@
 #include <QtWidgets/QMessageBox>
 #include <QtWidgets/QVBoxLayout>
 
-#include "application/project_describer.hpp"
+#include "core/report_writer.hpp"
+#include "core/scanner.hpp"
 #include "utils/logging.hpp"
 #include "utils/user_notifier.hpp"
 
@@ -149,43 +151,73 @@ void MainWindow::OnStart() {
 
     SetBusy(true);
     status_label_->setText("Scanning…");
-    QApplication::processEvents();   // flush UI before blocking scan
+    QApplication::processEvents();
 
     try {
-        project_describer::CommandLineOptions options;
-        options.project_root = std::filesystem::path(
+        const auto project_root = std::filesystem::path(
             project_path_edit_->text().toStdString());
-        options.output_directory = std::filesystem::path(
+        const auto output_dir = std::filesystem::path(
             output_path_edit_->text().toStdString());
 
-        // Capture stdout/stderr output into strings (GUI doesn't use terminal)
-        std::ostringstream captured_output;
-        std::ostringstream captured_errors;
+        // ── Step 1: Scan ──
+        const auto scan_result = Scanner::Scan(project_root, output_dir);
 
-        const int rc = project_describer::RunProjectDescriber(
-            options, captured_output, captured_errors);   // 3rd arg is std::ostream&
+        // ── Step 2: Populate tree model ──
+        tree_model_->removeRows(0, tree_model_->rowCount());
+        for (const auto& file : scan_result.text_files) {
+            const auto line_count = static_cast<int>(
+                std::count(file.content.begin(), file.content.end(), '\n'));
+            // If file is non-empty and doesn't end with newline, add 1
+            const int adjusted_lines = file.content.empty() ? 0
+                : (file.content.back() == '\n' ? line_count : line_count + 1);
 
-        preview_edit_->setPlainText(
-            QString::fromStdString(captured_output.str()) + "\n" +
-            (captured_errors.str().empty()
-                 ? QString()
-                 : QString("[stderr]\n") +
-                       QString::fromStdString(captured_errors.str())));
+            auto* path_item = new QStandardItem(
+                QString::fromStdString(file.relative_path.generic_string()));
+            auto* lines_item = new QStandardItem(QString::number(adjusted_lines));
+            lines_item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            auto* enc_item = new QStandardItem(
+                QString::fromStdString(std::string(EncodingName(file.source_encoding))));
 
-        if (rc != 0) {
-            status_label_->setText("Failed — see log for details.");
-            const auto err_text = captured_errors.str();
-            QMessageBox::critical(
-                this, "Run failed",
-                "project-describer returned exit code " +
-                    QString::number(rc) + ".\n" +
-                (err_text.empty()
-                     ? QString("See describer.log for details.")
-                     : QString::fromStdString(err_text)));
-            LOG_ERROR("Run failed, exit code {}", rc);
-        } else {
-            status_label_->setText("Done!");
+            path_item->setEditable(false);
+            lines_item->setEditable(false);
+            enc_item->setEditable(false);
+
+            tree_model_->appendRow({path_item, lines_item, enc_item});
         }
+
+        // ── Step 3: Render report ──
+        status_label_->setText("Rendering report…");
+        QApplication::processEvents();
+        const auto report = ReportWriter::Render(project_root, scan_result);
+
+        // ── Step 4: Write file ──
+        status_label_->setText("Writing file…");
+        QApplication::processEvents();
+        const auto output_path = ReportWriter::ChooseOutputPath(output_dir);
+        std::string write_error;
+        if (!ReportWriter::WriteUtf8(output_path, report, write_error)) {
+            status_label_->setText("Write failed — see log.");
+            QMessageBox::critical(this, "Write failed",
+                                  QString::fromStdString(write_error));
+            LOG_ERROR("Write failed: {}", write_error);
+            SetBusy(false);
+            return;
+        }
+
+        // ── Step 5: Preview ──
+        std::ostringstream preview;
+        preview << "Files scanned: " << scan_result.scanned_files << '\n';
+        preview << "Text files found: " << scan_result.text_files.size() << '\n';
+        preview << "Done! Wrote: " << output_path.string() << "\n\n";
+        if (!scan_result.warnings.empty()) {
+            preview << "Warnings (" << scan_result.warnings.size()
+                    << " total — see log for details)\n";
+        }
+        preview_edit_->setPlainText(QString::fromStdString(preview.str()));
+
+        status_label_->setText("Done!");
+        LOG_INFO("All done: {}", output_path.string());
+
     } catch (const std::bad_alloc& e) {
         LOG_CRITICAL("Out of memory: {}", e.what());
         status_label_->setText("Out of memory.");
