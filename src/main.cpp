@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -8,10 +9,28 @@
 
 #include "application/command_line.hpp"
 #include "application/project_describer.hpp"
+#include "utils/logging.hpp"
+#include "utils/user_notifier.hpp"
 
 namespace {
 
+void CliErrorMessage(const std::string& title, const std::string& detail) {
+    std::cerr << "\n*** " << title << " ***\n" << detail << "\n\n";
+}
+
+void CliInfoMessage(const std::string& message) {
+    std::cout << message << '\n';
+}
+
 int Run(const int argc, const char* const argv[]) {
+    // Initialize logging — file goes next to the executable
+    project_describer::log::Initialize(
+        project_describer::log::Mode::kCli,
+        std::filesystem::current_path().string());
+
+    project_describer::SetUserErrorCallback(&CliErrorMessage);
+    project_describer::SetUserInfoCallback(&CliInfoMessage);
+
     const auto parsed = project_describer::ParseCommandLine(argc, argv);
     if (parsed.status == project_describer::ParseStatus::kHelpRequested) {
         std::cout << project_describer::UsageText();
@@ -46,20 +65,30 @@ std::string WideToUtf8(const std::wstring& value) {
 
 #ifdef _WIN32
 int wmain(const int argc, wchar_t* argv[]) {
-    std::vector<std::string> utf8_arguments;
-    utf8_arguments.reserve(static_cast<std::size_t>(argc));
-    for (int index = 0; index < argc; ++index) {
-        utf8_arguments.push_back(WideToUtf8(argv[index]));
+    try {
+        std::vector<std::string> utf8_arguments;
+        utf8_arguments.reserve(static_cast<std::size_t>(argc));
+        for (int index = 0; index < argc; ++index) {
+            utf8_arguments.push_back(WideToUtf8(argv[index]));
+        }
+        std::vector<const char*> raw_arguments;
+        raw_arguments.reserve(utf8_arguments.size());
+        for (const auto& argument : utf8_arguments) {
+            raw_arguments.push_back(argument.c_str());
+        }
+        return Run(argc, raw_arguments.data());
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << '\n';
+        return 1;
     }
-    std::vector<const char*> raw_arguments;
-    raw_arguments.reserve(utf8_arguments.size());
-    for (const auto& argument : utf8_arguments) {
-        raw_arguments.push_back(argument.c_str());
-    }
-    return Run(argc, raw_arguments.data());
 }
 #else
 int main(const int argc, char* argv[]) {
-    return Run(argc, argv);
+    try {
+        return Run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << '\n';
+        return 1;
+    }
 }
 #endif
