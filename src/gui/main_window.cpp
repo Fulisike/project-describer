@@ -1,9 +1,15 @@
 #include "gui/main_window.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <functional>
+#include <iterator>
+#include <set>
 #include <sstream>
+#include <stdexcept>
 
 #include <QtCore/QDir>
+#include <QtGui/QStandardItem>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QHBoxLayout>
@@ -12,26 +18,67 @@
 #include <QtWidgets/QMessageBox>
 #include <QtWidgets/QVBoxLayout>
 
+#include "core/context_loader.hpp"
 #include "core/report_writer.hpp"
-#include "core/scanner.hpp"
+#include "model/text_encoding.hpp"
 #include "utils/logging.hpp"
-#include "utils/user_notifier.hpp"
 
 namespace project_describer::gui {
 namespace {
 
-constexpr int kDefaultColumnWidth = 400;
+constexpr int kFileIndexRole = Qt::UserRole + 1;
+
+std::filesystem::path PathFromQString(const QString& value) {
+#ifdef _WIN32
+    return std::filesystem::path(value.toStdWString());
+#else
+    return std::filesystem::u8path(value.toUtf8().constData());
+#endif
+}
+
+QString PathToQString(const std::filesystem::path& value) {
+    const auto utf8 = value.generic_u8string();
+    return QString::fromUtf8(reinterpret_cast<const char*>(utf8.data()),
+                             static_cast<qsizetype>(utf8.size()));
+}
+
+int LineCount(const std::string& content) {
+    const auto newlines = static_cast<int>(
+        std::count(content.begin(), content.end(), '\n'));
+    return content.empty() ? 0 : (content.back() == '\n' ? newlines : newlines + 1);
+}
+
+void AppendScan(ScanResult& destination, ScanResult source) {
+    destination.scanned_files += source.scanned_files;
+    destination.text_files.insert(destination.text_files.end(),
+                                  std::make_move_iterator(source.text_files.begin()),
+                                  std::make_move_iterator(source.text_files.end()));
+    destination.warnings.insert(destination.warnings.end(),
+                                std::make_move_iterator(source.warnings.begin()),
+                                std::make_move_iterator(source.warnings.end()));
+}
+
+void AddSelectedEntry(ScanResult& result, const std::filesystem::path& path,
+                      std::set<std::string>& added) {
+    std::filesystem::path current;
+    for (auto it = path.begin(); it != path.end(); ++it) {
+        current /= *it;
+        const auto utf8 = current.generic_u8string();
+        const std::string key(utf8.begin(), utf8.end());
+        if (added.insert(key).second) {
+            result.entries.push_back({current, std::next(it) != path.end()});
+        }
+    }
+}
 
 }  // namespace
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent) {
     SetupUI();
-
     project_path_edit_->setText(QDir::currentPath());
     output_path_edit_->setText(QDir::currentPath());
-    status_label_->setText("Ready. Pick a project folder to describe.");
-
+    status_label_->setText("请选择上下文来源，然后加载文件树。");
     LOG_INFO("GUI window created");
 }
 
@@ -41,68 +88,103 @@ MainWindow::~MainWindow() {
 
 void MainWindow::SetupUI() {
     setWindowTitle("Project Describer");
-    resize(900, 640);
+    resize(980, 720);
 
     auto* central = new QWidget(this);
     auto* layout = new QVBoxLayout(central);
 
-    // Folder row 1: project root
     {
         auto* row = new QHBoxLayout;
-        row->addWidget(new QLabel("Project folder:", central));
+        row->addWidget(new QLabel("项目目录：", central));
         project_path_edit_ = new QLineEdit(central);
-        row->addWidget(project_path_edit_, /*stretch=*/1);
-        browse_project_btn_ = new QPushButton("Browse…", central);
-        connect(browse_project_btn_, &QPushButton::clicked, this, &MainWindow::OnBrowseProject);
+        row->addWidget(project_path_edit_, 1);
+        browse_project_btn_ = new QPushButton("浏览…", central);
+        connect(browse_project_btn_, &QPushButton::clicked, this,
+                &MainWindow::OnBrowseProject);
         row->addWidget(browse_project_btn_);
         layout->addLayout(row);
     }
-    // Folder row 2: output directory
     {
         auto* row = new QHBoxLayout;
-        row->addWidget(new QLabel("Output folder:", central));
+        row->addWidget(new QLabel("输出目录：", central));
         output_path_edit_ = new QLineEdit(central);
-        row->addWidget(output_path_edit_, /*stretch=*/1);
-        browse_output_btn_ = new QPushButton("Browse…", central);
-        connect(browse_output_btn_, &QPushButton::clicked, this, &MainWindow::OnBrowseOutput);
+        row->addWidget(output_path_edit_, 1);
+        browse_output_btn_ = new QPushButton("浏览…", central);
+        connect(browse_output_btn_, &QPushButton::clicked, this,
+                &MainWindow::OnBrowseOutput);
         row->addWidget(browse_output_btn_);
         layout->addLayout(row);
     }
-    // Start button
     {
-        start_btn_ = new QPushButton("Start", central);
-        connect(start_btn_, &QPushButton::clicked, this, &MainWindow::OnStart);
-        layout->addWidget(start_btn_);
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel("加载来源：", central));
+        project_files_check_ = new QCheckBox("项目文件", central);
+        project_files_check_->setChecked(true);
+        codex_context_check_ = new QCheckBox("Codex 上下文", central);
+        claude_context_check_ = new QCheckBox("Claude Code 上下文", central);
+        row->addWidget(project_files_check_);
+        row->addWidget(codex_context_check_);
+        row->addWidget(claude_context_check_);
+        row->addStretch(1);
+        load_btn_ = new QPushButton("加载 / 刷新", central);
+        connect(load_btn_, &QPushButton::clicked, this, &MainWindow::OnLoad);
+        row->addWidget(load_btn_);
+        layout->addLayout(row);
     }
-    // Tree view showing scanned description
     {
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel("勾选需要写入 describer 文本的文件：", central));
+        row->addStretch(1);
+        select_all_btn_ = new QPushButton("全选", central);
+        connect(select_all_btn_, &QPushButton::clicked, this,
+                [this] { SetAllChecked(Qt::Checked); });
+        row->addWidget(select_all_btn_);
+        select_none_btn_ = new QPushButton("全不选", central);
+        connect(select_none_btn_, &QPushButton::clicked, this,
+                [this] { SetAllChecked(Qt::Unchecked); });
+        row->addWidget(select_none_btn_);
+        auto* expand_btn = new QPushButton("全部展开", central);
+        row->addWidget(expand_btn);
+        auto* collapse_btn = new QPushButton("全部收起", central);
+        row->addWidget(collapse_btn);
+        layout->addLayout(row);
+
         tree_view_ = new QTreeView(central);
-        tree_model_ = new QStandardItemModel(this);
-        tree_model_->setHorizontalHeaderLabels({"Path", "Lines", "Encoding"});
-        tree_view_->setModel(tree_model_);
-        tree_view_->setColumnWidth(0, kDefaultColumnWidth);
-        tree_view_->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-        layout->addWidget(tree_view_, /*stretch=*/1);
+        connect(expand_btn, &QPushButton::clicked, tree_view_, &QTreeView::expandAll);
+        connect(collapse_btn, &QPushButton::clicked, tree_view_, &QTreeView::collapseAll);
     }
-    // Preview
+    {
+        tree_view_->setParent(central);
+        tree_model_ = new QStandardItemModel(this);
+        tree_model_->setHorizontalHeaderLabels({"文件树"});
+        tree_view_->setModel(tree_model_);
+        tree_view_->setAlternatingRowColors(true);
+        tree_view_->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+        connect(tree_model_, &QStandardItemModel::itemChanged, this,
+                &MainWindow::OnTreeItemChanged);
+        layout->addWidget(tree_view_, 3);
+    }
     {
         preview_edit_ = new QTextEdit(central);
         preview_edit_->setReadOnly(true);
-        preview_edit_->setPlaceholderText(
-            "Report preview will appear here. Full text is written to describer.txt.");
-        layout->addWidget(preview_edit_, /*stretch=*/1);
+        preview_edit_->setPlaceholderText("加载和导出结果会显示在这里。");
+        preview_edit_->setMaximumHeight(150);
+        layout->addWidget(preview_edit_, 1);
     }
-    // Status bar area
     {
-        auto* status_layout = new QHBoxLayout;
+        auto* row = new QHBoxLayout;
         status_label_ = new QLabel(central);
-        status_layout->addWidget(status_label_, /*stretch=*/1);
+        row->addWidget(status_label_, 1);
         progress_bar_ = new QProgressBar(central);
-        progress_bar_->setRange(0, 0);          // indeterminate
+        progress_bar_->setRange(0, 0);
         progress_bar_->setFixedWidth(160);
         progress_bar_->hide();
-        status_layout->addWidget(progress_bar_);
-        layout->addLayout(status_layout);
+        row->addWidget(progress_bar_);
+        start_btn_ = new QPushButton("导出所选文件", central);
+        start_btn_->setEnabled(false);
+        connect(start_btn_, &QPushButton::clicked, this, &MainWindow::OnStart);
+        row->addWidget(start_btn_);
+        layout->addLayout(row);
     }
 
     setCentralWidget(central);
@@ -111,143 +193,294 @@ void MainWindow::SetupUI() {
 void MainWindow::OnBrowseProject() {
     try {
         const QString dir = QFileDialog::getExistingDirectory(
-            this, "Select project folder", project_path_edit_->text());
+            this, "选择项目目录", project_path_edit_->text());
         if (!dir.isEmpty()) {
             project_path_edit_->setText(QDir::toNativeSeparators(dir));
+            loaded_project_path_.clear();
+            start_btn_->setEnabled(false);
+            status_label_->setText("项目目录已更改，请重新加载文件树。");
         }
     } catch (const std::exception& e) {
         LOG_ERROR("Error in folder dialog: {}", e.what());
-        QMessageBox::critical(this, "Error",
-                              "Failed to open folder dialog:\n" +
-                              QString::fromUtf8(e.what()));
+        QMessageBox::critical(this, "错误", "无法打开目录选择器：\n" +
+                                              QString::fromUtf8(e.what()));
     }
 }
 
 void MainWindow::OnBrowseOutput() {
     try {
         const QString dir = QFileDialog::getExistingDirectory(
-            this, "Select output folder", output_path_edit_->text());
+            this, "选择输出目录", output_path_edit_->text());
         if (!dir.isEmpty()) {
             output_path_edit_->setText(QDir::toNativeSeparators(dir));
         }
     } catch (const std::exception& e) {
         LOG_ERROR("Error in folder dialog: {}", e.what());
-        QMessageBox::critical(this, "Error",
-                              "Failed to open folder dialog:\n" +
-                              QString::fromUtf8(e.what()));
+        QMessageBox::critical(this, "错误", "无法打开目录选择器：\n" +
+                                              QString::fromUtf8(e.what()));
     }
 }
 
-void MainWindow::OnStart() {
-    LOG_INFO("Start clicked; project='{}' output='{}'",
-             project_path_edit_->text().toStdString(),
-             output_path_edit_->text().toStdString());
+void MainWindow::OnLoad() {
+    if (project_path_edit_->text().trimmed().isEmpty()) {
+        QMessageBox::warning(this, "缺少项目目录", "请先选择项目目录。");
+        return;
+    }
+    if (!project_files_check_->isChecked() && !codex_context_check_->isChecked() &&
+        !claude_context_check_->isChecked()) {
+        QMessageBox::warning(this, "缺少加载来源", "请至少选择一种加载来源。");
+        return;
+    }
 
-    if (project_path_edit_->text().isEmpty()) {
-        QMessageBox::warning(this, "Missing project folder",
-                             "Please select a project folder first.");
+    const auto project_root = PathFromQString(project_path_edit_->text());
+    std::error_code error;
+    if (!std::filesystem::is_directory(project_root, error) || error) {
+        QMessageBox::warning(this, "无效项目目录", "项目目录不存在或不可读取。");
         return;
     }
 
     SetBusy(true);
-    status_label_->setText("Scanning…");
+    status_label_->setText("正在加载文件树…");
     QApplication::processEvents();
 
     try {
-        const auto project_root = std::filesystem::path(
-            project_path_edit_->text().toStdString());
-        const auto output_dir = std::filesystem::path(
-            output_path_edit_->text().toStdString());
-
-        // ── Step 1: Scan ──
-        const auto scan_result = Scanner::Scan(project_root, output_dir);
-
-        // ── Step 2: Populate tree model ──
-        tree_model_->removeRows(0, tree_model_->rowCount());
-        for (const auto& file : scan_result.text_files) {
-            const auto line_count = static_cast<int>(
-                std::count(file.content.begin(), file.content.end(), '\n'));
-            // If file is non-empty and doesn't end with newline, add 1
-            const int adjusted_lines = file.content.empty() ? 0
-                : (file.content.back() == '\n' ? line_count : line_count + 1);
-
-            const auto u8path = file.relative_path.generic_u8string();
-            auto* path_item = new QStandardItem(QString::fromUtf8(
-                reinterpret_cast<const char*>(u8path.data()),
-                static_cast<qsizetype>(u8path.size())));
-            path_item->setEditable(false);
-
-            auto* lines_item = new QStandardItem(QString::number(adjusted_lines));
-            lines_item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            lines_item->setEditable(false);
-            auto* enc_item = new QStandardItem(
-                QString::fromStdString(std::string(EncodingName(file.source_encoding))));
-            enc_item->setEditable(false);
-
-            tree_model_->appendRow({path_item, lines_item, enc_item});
+        loaded_scan_ = {};
+        const auto output_dir = PathFromQString(output_path_edit_->text());
+        if (project_files_check_->isChecked()) {
+            AppendScan(loaded_scan_, Scanner::Scan(project_root, output_dir));
+        }
+        if (codex_context_check_->isChecked()) {
+            status_label_->setText("正在加载 Codex 上下文…");
+            QApplication::processEvents();
+            AppendScan(loaded_scan_, ContextLoader::LoadCodex(project_root));
+        }
+        if (claude_context_check_->isChecked()) {
+            status_label_->setText("正在加载 Claude Code 上下文…");
+            QApplication::processEvents();
+            AppendScan(loaded_scan_, ContextLoader::LoadClaudeCode(project_root));
         }
 
-        // ── Step 3: Render report ──
-        status_label_->setText("Rendering report…");
-        QApplication::processEvents();
-        const auto report = ReportWriter::Render(project_root, scan_result);
+        loaded_project_path_ = QDir::cleanPath(project_path_edit_->text());
+        PopulateTree();
+        start_btn_->setEnabled(!loaded_scan_.text_files.empty());
 
-        // ── Step 4: Write file ──
-        status_label_->setText("Writing file…");
-        QApplication::processEvents();
+        std::ostringstream summary;
+        summary << "Loaded " << loaded_scan_.text_files.size()
+                << " selectable text files.\n"
+                << "Expand folders and uncheck anything that should not be exported.";
+        if (!loaded_scan_.warnings.empty()) {
+            summary << "\nWarnings: " << loaded_scan_.warnings.size()
+                    << " (see project-describer.log).";
+        }
+        preview_edit_->setPlainText(QString::fromStdString(summary.str()));
+        status_label_->setText(QString("已加载 %1 个可选文件。").arg(
+            static_cast<qulonglong>(loaded_scan_.text_files.size())));
+        LOG_INFO("Loaded {} selectable files", loaded_scan_.text_files.size());
+    } catch (const std::exception& e) {
+        LOG_ERROR("Context load failed: {}", e.what());
+        loaded_project_path_.clear();
+        start_btn_->setEnabled(false);
+        status_label_->setText("加载失败，请查看日志。");
+        QMessageBox::critical(this, "加载失败", QString::fromUtf8(e.what()));
+    }
+
+    SetBusy(false);
+}
+
+void MainWindow::PopulateTree() {
+    updating_checks_ = true;
+    tree_model_->clear();
+    tree_model_->setHorizontalHeaderLabels({"文件树"});
+
+    auto find_or_add_child = [](QStandardItem* parent, const QString& name) {
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            if (parent->child(row)->text() == name &&
+                !parent->child(row)->data(kFileIndexRole).isValid()) {
+                return parent->child(row);
+            }
+        }
+        auto* item = new QStandardItem(name);
+        item->setEditable(false);
+        item->setCheckable(true);
+        item->setCheckState(Qt::Checked);
+        parent->appendRow(item);
+        return item;
+    };
+
+    for (std::size_t index = 0; index < loaded_scan_.text_files.size(); ++index) {
+        const auto& file = loaded_scan_.text_files[index];
+        std::vector<std::filesystem::path> components(file.relative_path.begin(),
+                                                      file.relative_path.end());
+        if (components.empty()) {
+            continue;
+        }
+
+        QStandardItem* parent = tree_model_->invisibleRootItem();
+        const auto first = components.front().string();
+        if (first != "Codex" && first != "Claude Code") {
+            parent = find_or_add_child(parent, "项目文件");
+        }
+        for (std::size_t part = 0; part < components.size(); ++part) {
+            const bool is_leaf = part + 1 == components.size();
+            const QString name = PathToQString(components[part]);
+            if (!is_leaf) {
+                parent = find_or_add_child(parent, name);
+                continue;
+            }
+            auto* item = new QStandardItem(name);
+            item->setEditable(false);
+            item->setCheckable(true);
+            item->setCheckState(Qt::Checked);
+            item->setData(QVariant::fromValue(static_cast<qulonglong>(index)),
+                          kFileIndexRole);
+            item->setToolTip(QString("%1\n%2 行 · %3")
+                                 .arg(PathToQString(file.relative_path))
+                                 .arg(LineCount(file.content))
+                                 .arg(QString::fromStdString(
+                                     std::string(EncodingName(file.source_encoding)))));
+            parent->appendRow(item);
+        }
+    }
+
+    updating_checks_ = false;
+    tree_view_->expandToDepth(1);
+}
+
+void MainWindow::OnTreeItemChanged(QStandardItem* item) {
+    if (updating_checks_ || item == nullptr) {
+        return;
+    }
+    updating_checks_ = true;
+
+    if (item->hasChildren() && item->checkState() != Qt::PartiallyChecked) {
+        std::function<void(QStandardItem*)> set_children = [&](QStandardItem* parent) {
+            for (int row = 0; row < parent->rowCount(); ++row) {
+                auto* child = parent->child(row);
+                child->setCheckState(parent->checkState());
+                set_children(child);
+            }
+        };
+        set_children(item);
+    }
+
+    for (auto* parent = item->parent(); parent != nullptr; parent = parent->parent()) {
+        int checked = 0;
+        int unchecked = 0;
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            const auto state = parent->child(row)->checkState();
+            checked += state == Qt::Checked;
+            unchecked += state == Qt::Unchecked;
+        }
+        if (checked == parent->rowCount()) {
+            parent->setCheckState(Qt::Checked);
+        } else if (unchecked == parent->rowCount()) {
+            parent->setCheckState(Qt::Unchecked);
+        } else {
+            parent->setCheckState(Qt::PartiallyChecked);
+        }
+    }
+    updating_checks_ = false;
+}
+
+void MainWindow::SetAllChecked(Qt::CheckState state) {
+    updating_checks_ = true;
+    std::function<void(QStandardItem*)> set_state = [&](QStandardItem* parent) {
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            auto* child = parent->child(row);
+            child->setCheckState(state);
+            set_state(child);
+        }
+    };
+    set_state(tree_model_->invisibleRootItem());
+    updating_checks_ = false;
+}
+
+void MainWindow::OnStart() {
+    if (loaded_project_path_.isEmpty() ||
+        loaded_project_path_ != QDir::cleanPath(project_path_edit_->text())) {
+        QMessageBox::warning(this, "需要重新加载", "项目目录已变化，请先重新加载文件树。");
+        return;
+    }
+
+    std::vector<std::size_t> selected_indices;
+    std::function<void(QStandardItem*)> collect = [&](QStandardItem* parent) {
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            auto* child = parent->child(row);
+            const auto value = child->data(kFileIndexRole);
+            if (value.isValid() && child->checkState() == Qt::Checked) {
+                selected_indices.push_back(static_cast<std::size_t>(value.toULongLong()));
+            }
+            collect(child);
+        }
+    };
+    collect(tree_model_->invisibleRootItem());
+    if (selected_indices.empty()) {
+        QMessageBox::warning(this, "未选择文件", "请至少勾选一个要导出的文件。");
+        return;
+    }
+
+    const auto output_dir = PathFromQString(output_path_edit_->text());
+    std::error_code error;
+    if (!std::filesystem::is_directory(output_dir, error) || error) {
+        QMessageBox::warning(this, "无效输出目录", "输出目录不存在或不可写。");
+        return;
+    }
+
+    SetBusy(true);
+    status_label_->setText("正在生成 describer 文本…");
+    QApplication::processEvents();
+
+    try {
+        ScanResult selected;
+        selected.scanned_files = selected_indices.size();
+        selected.warnings = loaded_scan_.warnings;
+        std::set<std::string> added_entries;
+        for (const auto index : selected_indices) {
+            if (index >= loaded_scan_.text_files.size()) {
+                continue;
+            }
+            selected.text_files.push_back(loaded_scan_.text_files[index]);
+            AddSelectedEntry(selected, loaded_scan_.text_files[index].relative_path,
+                             added_entries);
+        }
+
+        const auto project_root = PathFromQString(project_path_edit_->text());
+        const auto report = ReportWriter::Render(project_root, selected);
         const auto output_path = ReportWriter::ChooseOutputPath(output_dir);
         std::string write_error;
         if (!ReportWriter::WriteUtf8(output_path, report, write_error)) {
-            status_label_->setText("Write failed — see log.");
-            QMessageBox::critical(this, "Write failed",
-                                  QString::fromStdString(write_error));
-            LOG_ERROR("Write failed: {}", write_error);
-            SetBusy(false);
-            return;
+            throw std::runtime_error(write_error);
         }
 
-        // ── Step 5: Preview ──
-        std::ostringstream preview;
-        preview << "Files scanned: " << scan_result.scanned_files << '\n';
-        preview << "Text files found: " << scan_result.text_files.size() << '\n';
-        preview << "Done! Wrote: " << output_path.string() << "\n\n";
-        if (!scan_result.warnings.empty()) {
-            preview << "Warnings (" << scan_result.warnings.size()
-                    << " total — see log for details)\n";
-        }
-        preview_edit_->setPlainText(QString::fromStdString(preview.str()));
-
-        status_label_->setText("Done!");
-        LOG_INFO("All done: {}", output_path.string());
-
-    } catch (const std::bad_alloc& e) {
-        LOG_CRITICAL("Out of memory: {}", e.what());
-        status_label_->setText("Out of memory.");
-        QMessageBox::critical(this, "Out of memory",
-                              "Not enough memory to complete the operation:\n" +
-                              QString::fromUtf8(e.what()));
-    } catch (const std::filesystem::filesystem_error& e) {
-        LOG_CRITICAL("Filesystem error: {}", e.what());
-        status_label_->setText("Filesystem error — see log.");
-        QMessageBox::critical(this, "Filesystem error",
-                              QString::fromUtf8(e.what()));
+        preview_edit_->setPlainText(
+            QString("已导出 %1 个文件。\n%2")
+                .arg(static_cast<qulonglong>(selected.text_files.size()))
+                .arg(PathToQString(output_path)));
+        status_label_->setText("导出完成。");
+        LOG_INFO("Exported {} selected files to {}", selected.text_files.size(),
+                 output_path.string());
     } catch (const std::exception& e) {
-        LOG_CRITICAL("Unhandled exception in OnStart: {}", e.what());
-        status_label_->setText("Unexpected error — see log.");
-        QMessageBox::critical(this, "Unexpected error",
-                              "An unexpected error occurred:\n" +
-                              QString::fromUtf8(e.what()));
+        LOG_ERROR("Export failed: {}", e.what());
+        status_label_->setText("导出失败，请查看日志。");
+        QMessageBox::critical(this, "导出失败", QString::fromUtf8(e.what()));
     }
 
     SetBusy(false);
 }
 
 void MainWindow::SetBusy(bool busy) {
-    start_btn_->setEnabled(!busy);
+    load_btn_->setEnabled(!busy);
+    start_btn_->setEnabled(!busy && !loaded_project_path_.isEmpty() &&
+                           !loaded_scan_.text_files.empty());
     browse_project_btn_->setEnabled(!busy);
     browse_output_btn_->setEnabled(!busy);
+    project_files_check_->setEnabled(!busy);
+    codex_context_check_->setEnabled(!busy);
+    claude_context_check_->setEnabled(!busy);
+    select_all_btn_->setEnabled(!busy);
+    select_none_btn_->setEnabled(!busy);
     if (busy) {
-        progress_bar_->setRange(0, 0);   // indeterminate
+        progress_bar_->setRange(0, 0);
         progress_bar_->show();
     } else {
         progress_bar_->hide();

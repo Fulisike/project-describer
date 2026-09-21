@@ -20,6 +20,9 @@ The executable is `build/Debug/project-describer.exe` for the Visual Studio gene
 For a single distributable executable, build `Release` and copy
 `build/Release/project-describer.exe`.
 
+The Qt GUI executable is `build/Debug/project-describer-gui.exe`. Its window and
+Windows executable icon are built from `pd.ico`.
+
 ## Use
 
 ```powershell
@@ -33,6 +36,22 @@ the report is written to the project root. The tool chooses `describer.txt`, the
 generated `describer*.txt` files in the output directory are excluded from later scans.
 
 Run `project-describer --help` for the command summary.
+
+## GUI file selection and AI context
+
+The GUI separates loading from exporting:
+
+1. Choose a project and one or more sources: project files, Codex context, or
+   Claude Code context.
+2. Click **Load / Refresh** and expand or collapse the resulting hierarchy.
+3. Check only the files that should be included, then click **Export selected files**.
+
+Codex discovery covers layered `AGENTS.md`/`AGENTS.override.md` instructions,
+configured fallback instruction names, user and project configuration, local skills,
+and local memories. Claude Code discovery covers managed, user, and project
+instructions and settings; rules, skills, commands, agents, output styles, project
+auto-memory, and recursive `@path` imports. Authentication material, conversation
+transcripts, logs, and caches are deliberately excluded from export candidates.
 
 ## Text and encoding behavior
 

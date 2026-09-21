@@ -1,10 +1,12 @@
 #include "core/scanner.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <set>
 #include <string>
+#include <string_view>
 
 #include "utils/file_reader.hpp"
 #include "utils/logging.hpp"
@@ -33,6 +35,32 @@ bool HasBinaryExtension(const std::filesystem::path& path) {
         ".class", ".jar", ".war", ".pyc", ".pyo",
         ".pak", ".assets", ".dylib", ".dSYM", ".swp", ".swo"};
     return kBinaryExts.count(path.extension().string()) > 0;
+}
+
+bool IsGeneratedReport(const std::filesystem::path& path,
+                       const std::filesystem::path& output_directory) {
+    std::error_code path_error;
+    const auto parent = std::filesystem::weakly_canonical(path.parent_path(), path_error);
+    std::error_code output_error;
+    const auto output = std::filesystem::weakly_canonical(output_directory, output_error);
+    if (path_error || output_error || parent != output) {
+        return false;
+    }
+
+    const auto name = path.filename().string();
+    if (name == "describer.txt") {
+        return true;
+    }
+    constexpr std::string_view prefix = "describer";
+    constexpr std::string_view suffix = ".txt";
+    if (!name.starts_with(prefix) || !name.ends_with(suffix)) {
+        return false;
+    }
+    const auto number = std::string_view(name).substr(
+        prefix.size(), name.size() - prefix.size() - suffix.size());
+    return !number.empty() &&
+           std::all_of(number.begin(), number.end(),
+                       [](unsigned char ch) { return std::isdigit(ch) != 0; });
 }
 
 }  // namespace
@@ -80,6 +108,11 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
 
             const auto& entry = *it;
             const auto& path = entry.path();
+
+            if (!entry.is_directory() && IsGeneratedReport(path, output_directory)) {
+                ++result.scanned_files;
+                continue;
+            }
 
             // Build ProjectEntry regardless of file/dir
             {
@@ -145,6 +178,17 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
                          file_result.text.utf8});
             ++result.scanned_files;
         }
+
+        std::sort(result.entries.begin(), result.entries.end(),
+                  [](const ProjectEntry& left, const ProjectEntry& right) {
+                      return left.relative_path.generic_u8string() <
+                             right.relative_path.generic_u8string();
+                  });
+        std::sort(result.text_files.begin(), result.text_files.end(),
+                  [](const FileItem& left, const FileItem& right) {
+                      return left.relative_path.generic_u8string() <
+                             right.relative_path.generic_u8string();
+                  });
 
         LOG_INFO("Scan complete: {} files scanned, {} text files found",
                  result.scanned_files, result.text_files.size());

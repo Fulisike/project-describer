@@ -1,5 +1,6 @@
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QMessageBox>
+#include <QtGui/QIcon>
 
 #include "gui/main_window.hpp"
 #include "utils/logging.hpp"
@@ -26,6 +27,7 @@ int main(int argc, char* argv[]) {
         QApplication::setApplicationName("Project Describer");
         QApplication::setApplicationVersion("0.1.0");
         QApplication::setOrganizationName("ProjectDescriber");
+        QApplication::setWindowIcon(QIcon(":/app/pd.ico"));
 
         // Initialize logging — file goes next to the executable
         project_describer::log::Initialize(

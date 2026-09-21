@@ -23,6 +23,7 @@ FetchContent_MakeAvailable(spdlog)
 add_library(project_describer_core
     src/application/command_line.cpp
     src/application/project_describer.cpp
+    src/core/context_loader.cpp
     src/core/report_writer.cpp
     src/core/scanner.cpp
     src/model/text_encoding.cpp
@@ -63,6 +64,7 @@ if(BUILD_TESTING AND PROJECT_DESCRIBER_BUILD_TESTS)
     add_executable(project-describer-tests
         tests/test_main.cpp
         tests/test_command_line.cpp
+        tests/test_context_loader.cpp
         tests/test_encoding.cpp
         tests/test_scanner.cpp
         tests/test_report_writer.cpp
@@ -95,11 +97,16 @@ if(PROJECT_DESCRIBER_BUILD_GUI)
 
     # --- GUI target ---
     set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
 
     add_executable(project-describer-gui WIN32
         src/gui_main.cpp
         src/gui/main_window.cpp
+        src/gui/resources.qrc
     )
+    if(WIN32)
+        target_sources(project-describer-gui PRIVATE src/gui/project_describer.rc)
+    endif()
     target_link_libraries(project-describer-gui
         PRIVATE
             project_describer_core
