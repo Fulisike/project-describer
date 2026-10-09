@@ -23,6 +23,21 @@ For a single distributable executable, build `Release` and copy
 The Qt GUI executable is `build/Debug/project-describer-gui.exe`. Its window and
 Windows executable icon are built from `pd.ico`.
 
+For the current workspace, keep the existing `build` configuration (Visual Studio
+2022, x64, GUI and tests enabled) and use Release. Configuration is only needed
+when changing build options; ordinary edits need only an incremental build:
+
+```powershell
+cmake --build build --config Release --target project-describer-gui --parallel 4
+```
+
+Core-only validation avoids building or deploying Qt:
+
+```powershell
+cmake --build build --config Release --target project-describer project-describer-tests --parallel 4
+ctest --test-dir build -C Release -R '^project-describer-tests$' --output-on-failure
+```
+
 ## Use
 
 ```powershell
@@ -50,8 +65,31 @@ Codex discovery covers layered `AGENTS.md`/`AGENTS.override.md` instructions,
 configured fallback instruction names, user and project configuration, local skills,
 and local memories. Claude Code discovery covers managed, user, and project
 instructions and settings; rules, skills, commands, agents, output styles, project
-auto-memory, and recursive `@path` imports. Authentication material, conversation
-transcripts, logs, and caches are deliberately excluded from export candidates.
+auto-memory, and recursive `@path` imports. These appear under **Shared context**.
+
+Local conversation transcripts appear under **Sessions**, grouped by local
+profile, provider (Codex), selected project, and session ID. Each session is one
+readable Markdown document. Select a leaf to preview its decoded messages, tool
+calls/results, and recorded compaction information before choosing what to export.
+Codex reads `CODEX_HOME/sessions` and `archived_sessions`; Claude Code reads
+`CLAUDE_CONFIG_DIR/projects`, with their usual home-directory defaults.
+Project matching uses transcript `cwd` metadata, including custom Claude project
+folder names. Authentication files, logs, and caches are excluded.
+
+Account/authentication identity is displayed as unknown because local transcripts
+do not reliably record it. A readable transcript is not an exact reconstruction of
+the current model context: compaction, encrypted reasoning, images, referenced
+history, and cloud-only sessions can prevent that. Oversized or malformed records
+produce visible warnings. See [the format investigation](docs/session-context-research.md).
+
+Loading runs in the background. Project scanning pipelines directory enumeration
+through a bounded 64-job queue to up to four reading/decoding workers, then sorts
+the results. Directory links/junctions and file symlinks are not followed. Files
+retain the 1 MiB limit, checked again when opened; session records are capped at
+4 MiB and complete session input/output at 64 MiB.
+
+See [the performance measurements](docs/scanner-performance.md) for the algorithm,
+comparison with the original scanner, and the repeatable benchmark target.
 
 ## Text and encoding behavior
 

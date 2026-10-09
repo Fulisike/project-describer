@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <iterator>
 #include <set>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 
 #include <QtCore/QDir>
+#include <QtCore/QHash>
 #include <QtGui/QStandardItem>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QFileDialog>
@@ -83,6 +85,9 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 MainWindow::~MainWindow() {
+    if (load_thread_ != nullptr) {
+        load_thread_->wait();
+    }
     LOG_INFO("GUI window destroyed");
 }
 
@@ -170,6 +175,15 @@ void MainWindow::SetupUI() {
         preview_edit_->setPlaceholderText("加载和导出结果会显示在这里。");
         preview_edit_->setMaximumHeight(150);
         layout->addWidget(preview_edit_, 1);
+        connect(tree_view_->selectionModel(), &QItemSelectionModel::currentChanged,
+                this, [this](const QModelIndex& current) {
+            const auto index = current.data(kFileIndexRole);
+            if (index.isValid() && index.toULongLong() < loaded_scan_.text_files.size()) {
+                const auto& file = loaded_scan_.text_files[static_cast<std::size_t>(index.toULongLong())];
+                preview_edit_->setPlainText(QString::fromUtf8(file.content.data(),
+                    static_cast<qsizetype>(file.content.size())));
+            }
+        });
     }
     {
         auto* row = new QHBoxLayout;
@@ -241,50 +255,71 @@ void MainWindow::OnLoad() {
 
     SetBusy(true);
     status_label_->setText("正在加载文件树…");
-    QApplication::processEvents();
-
-    try {
-        loaded_scan_ = {};
-        const auto output_dir = PathFromQString(output_path_edit_->text());
-        if (project_files_check_->isChecked()) {
-            AppendScan(loaded_scan_, Scanner::Scan(project_root, output_dir));
+    const auto project_path = QDir::cleanPath(project_path_edit_->text());
+    const auto output_dir = PathFromQString(output_path_edit_->text());
+    const bool include_project = project_files_check_->isChecked();
+    const bool include_codex = codex_context_check_->isChecked();
+    const bool include_claude = claude_context_check_->isChecked();
+    struct LoadState {
+        ScanResult scan;
+        std::exception_ptr error;
+    };
+    const auto state = std::make_shared<LoadState>();
+    load_thread_ = QThread::create([state, project_root, output_dir,
+                                   include_project, include_codex, include_claude] {
+        try {
+            if (include_project) {
+                AppendScan(state->scan, Scanner::Scan(project_root, output_dir));
+            }
+            if (include_codex) {
+                AppendScan(state->scan, ContextLoader::LoadCodex(project_root));
+            }
+            if (include_claude) {
+                AppendScan(state->scan, ContextLoader::LoadClaudeCode(project_root));
+            }
+        } catch (...) {
+            state->error = std::current_exception();
         }
-        if (codex_context_check_->isChecked()) {
-            status_label_->setText("正在加载 Codex 上下文…");
-            QApplication::processEvents();
-            AppendScan(loaded_scan_, ContextLoader::LoadCodex(project_root));
-        }
-        if (claude_context_check_->isChecked()) {
-            status_label_->setText("正在加载 Claude Code 上下文…");
-            QApplication::processEvents();
-            AppendScan(loaded_scan_, ContextLoader::LoadClaudeCode(project_root));
-        }
+    });
+    load_thread_->setParent(this);
+    connect(load_thread_, &QThread::finished, this, [this, state, project_path] {
+        load_thread_ = nullptr;
+        try {
+            if (state->error) {
+                std::rethrow_exception(state->error);
+            }
+            loaded_scan_ = std::move(state->scan);
+            loaded_project_path_ = project_path;
+            PopulateTree();
+            start_btn_->setEnabled(!loaded_scan_.text_files.empty());
 
-        loaded_project_path_ = QDir::cleanPath(project_path_edit_->text());
-        PopulateTree();
-        start_btn_->setEnabled(!loaded_scan_.text_files.empty());
-
-        std::ostringstream summary;
-        summary << "Loaded " << loaded_scan_.text_files.size()
-                << " selectable text files.\n"
-                << "Expand folders and uncheck anything that should not be exported.";
-        if (!loaded_scan_.warnings.empty()) {
-            summary << "\nWarnings: " << loaded_scan_.warnings.size()
-                    << " (see project-describer.log).";
+            std::ostringstream summary;
+            summary << "Loaded " << loaded_scan_.text_files.size()
+                    << " selectable text files.\n"
+                    << "Expand folders and uncheck anything that should not be exported.";
+            if (!loaded_scan_.warnings.empty()) {
+                summary << "\nWarnings: " << loaded_scan_.warnings.size()
+                        << " (see describer.log).";
+                for (const auto& warning : loaded_scan_.warnings) {
+                    summary << "\n- " << warning;
+                    LOG_WARN("{}", warning);
+                }
+            }
+            preview_edit_->setPlainText(QString::fromStdString(summary.str()));
+            status_label_->setText(QString("已加载 %1 个可选文件。").arg(
+                static_cast<qulonglong>(loaded_scan_.text_files.size())));
+            LOG_INFO("Loaded {} selectable files", loaded_scan_.text_files.size());
+        } catch (const std::exception& e) {
+            LOG_ERROR("Context load failed: {}", e.what());
+            loaded_project_path_.clear();
+            start_btn_->setEnabled(false);
+            status_label_->setText("加载失败，请查看日志。");
+            QMessageBox::critical(this, "加载失败", QString::fromUtf8(e.what()));
         }
-        preview_edit_->setPlainText(QString::fromStdString(summary.str()));
-        status_label_->setText(QString("已加载 %1 个可选文件。").arg(
-            static_cast<qulonglong>(loaded_scan_.text_files.size())));
-        LOG_INFO("Loaded {} selectable files", loaded_scan_.text_files.size());
-    } catch (const std::exception& e) {
-        LOG_ERROR("Context load failed: {}", e.what());
-        loaded_project_path_.clear();
-        start_btn_->setEnabled(false);
-        status_label_->setText("加载失败，请查看日志。");
-        QMessageBox::critical(this, "加载失败", QString::fromUtf8(e.what()));
-    }
-
-    SetBusy(false);
+        SetBusy(false);
+    });
+    connect(load_thread_, &QThread::finished, load_thread_, &QObject::deleteLater);
+    load_thread_->start();
 }
 
 void MainWindow::PopulateTree() {
@@ -292,18 +327,18 @@ void MainWindow::PopulateTree() {
     tree_model_->clear();
     tree_model_->setHorizontalHeaderLabels({"文件树"});
 
-    auto find_or_add_child = [](QStandardItem* parent, const QString& name) {
-        for (int row = 0; row < parent->rowCount(); ++row) {
-            if (parent->child(row)->text() == name &&
-                !parent->child(row)->data(kFileIndexRole).isValid()) {
-                return parent->child(row);
-            }
+    QHash<QString, QStandardItem*> directories;
+    auto find_or_add_child = [&directories](QStandardItem* parent, const QString& name,
+                                            const QString& key) {
+        if (const auto found = directories.constFind(key); found != directories.cend()) {
+            return *found;
         }
         auto* item = new QStandardItem(name);
         item->setEditable(false);
         item->setCheckable(true);
         item->setCheckState(Qt::Checked);
         parent->appendRow(item);
+        directories.insert(key, item);
         return item;
     };
 
@@ -316,15 +351,18 @@ void MainWindow::PopulateTree() {
         }
 
         QStandardItem* parent = tree_model_->invisibleRootItem();
+        QString directory_key;
         const auto first = components.front().string();
         if (first != "Codex" && first != "Claude Code") {
-            parent = find_or_add_child(parent, "项目文件");
+            directory_key = "项目文件";
+            parent = find_or_add_child(parent, "项目文件", directory_key);
         }
         for (std::size_t part = 0; part < components.size(); ++part) {
             const bool is_leaf = part + 1 == components.size();
             const QString name = PathToQString(components[part]);
             if (!is_leaf) {
-                parent = find_or_add_child(parent, name);
+                directory_key += '/' + name;
+                parent = find_or_add_child(parent, name, directory_key);
                 continue;
             }
             auto* item = new QStandardItem(name);
@@ -474,6 +512,9 @@ void MainWindow::SetBusy(bool busy) {
                            !loaded_scan_.text_files.empty());
     browse_project_btn_->setEnabled(!busy);
     browse_output_btn_->setEnabled(!busy);
+    project_path_edit_->setEnabled(!busy);
+    output_path_edit_->setEnabled(!busy);
+    tree_view_->setEnabled(!busy);
     project_files_check_->setEnabled(!busy);
     codex_context_check_->setEnabled(!busy);
     claude_context_check_->setEnabled(!busy);

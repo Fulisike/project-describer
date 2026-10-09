@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <limits>
 #include <string>
 
 #include "utils/encoding.hpp"
@@ -15,7 +16,9 @@ struct FileReadResult {
 
 class FileReader {
 public:
-    static FileReadResult ReadTextFile(const std::filesystem::path& path);
+    static FileReadResult ReadTextFile(
+        const std::filesystem::path& path,
+        std::uintmax_t max_file_size = (std::numeric_limits<std::uintmax_t>::max)());
 };
 
 }  // namespace project_describer

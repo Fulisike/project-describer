@@ -23,6 +23,8 @@ struct ScanResult {
 
 struct ScannerConfig {
     std::uintmax_t max_file_size = 1 * 1024 * 1024;  // 1 MiB default
+    // 0 selects up to 4 readers based on hardware; 1 runs synchronously.
+    std::size_t worker_count = 0;
 };
 
 class Scanner {

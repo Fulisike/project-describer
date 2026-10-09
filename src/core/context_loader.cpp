@@ -15,11 +15,33 @@
 
 #include "utils/file_reader.hpp"
 #include "utils/logging.hpp"
+#include "core/session_loader.hpp"
 
 namespace project_describer {
 namespace {
 
 constexpr std::uintmax_t kMaxContextFileSize = 4 * 1024 * 1024;
+
+void GroupSharedContext(ScanResult& result) {
+    auto group = [](const std::filesystem::path& path) {
+        auto component = path.begin();
+        std::filesystem::path grouped = *component++;
+        grouped /= "Shared context";
+        for (; component != path.end(); ++component) {
+            grouped /= *component;
+        }
+        return grouped;
+    };
+    for (auto& file : result.text_files) {
+        file.relative_path = group(file.relative_path);
+    }
+    for (auto& entry : result.entries) {
+        entry.relative_path = group(entry.relative_path);
+    }
+    if (!result.entries.empty()) {
+        result.entries.push_back({*result.entries.front().relative_path.begin(), true});
+    }
+}
 
 std::filesystem::path HomeDirectory() {
 #ifdef _WIN32
@@ -414,6 +436,8 @@ ScanResult ContextLoader::LoadCodex(const std::filesystem::path& project_root,
         result.warnings.push_back("Could not completely scan Codex project context: " +
                                   error.message());
     }
+    GroupSharedContext(result);
+    AppendCodexSessions(result, project_root, codex_home);
     LOG_INFO("Loaded {} Codex context files", result.text_files.size());
     return result;
 }
@@ -510,6 +534,8 @@ ScanResult ContextLoader::LoadClaudeCode(const std::filesystem::path& project_ro
         result.warnings.push_back("Could not completely scan Claude project context: " +
                                   error.message());
     }
+    GroupSharedContext(result);
+    AppendClaudeSessions(result, project_root, claude_home);
     LOG_INFO("Loaded {} Claude Code context files", result.text_files.size());
     return result;
 }

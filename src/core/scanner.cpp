@@ -3,10 +3,21 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <filesystem>
+#include <iterator>
+#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include "utils/file_reader.hpp"
 #include "utils/logging.hpp"
@@ -38,19 +49,9 @@ bool HasBinaryExtension(const std::filesystem::path& path) {
 }
 
 bool IsGeneratedReport(const std::filesystem::path& path,
-                       const std::filesystem::path& output_directory) {
-    std::error_code path_error;
-    const auto parent = std::filesystem::weakly_canonical(path.parent_path(), path_error);
-    std::error_code output_error;
-    const auto output = std::filesystem::weakly_canonical(output_directory, output_error);
-    if (path_error || output_error || parent != output) {
-        return false;
-    }
-
+                       const std::filesystem::path& output_directory,
+                       const std::filesystem::path& canonical_output) {
     const auto name = path.filename().string();
-    if (name == "describer.txt") {
-        return true;
-    }
     constexpr std::string_view prefix = "describer";
     constexpr std::string_view suffix = ".txt";
     if (!name.starts_with(prefix) || !name.ends_with(suffix)) {
@@ -58,10 +59,153 @@ bool IsGeneratedReport(const std::filesystem::path& path,
     }
     const auto number = std::string_view(name).substr(
         prefix.size(), name.size() - prefix.size() - suffix.size());
-    return !number.empty() &&
-           std::all_of(number.begin(), number.end(),
-                       [](unsigned char ch) { return std::isdigit(ch) != 0; });
+    if (!std::all_of(number.begin(), number.end(),
+                     [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+        return false;
+    }
+    // Most files never require a canonical-path query. The output is resolved once.
+    std::error_code error;
+    const auto lexical_parent = std::filesystem::absolute(path.parent_path(), error).lexically_normal();
+#ifdef _WIN32
+    if (!error && _wcsicmp(lexical_parent.c_str(), output_directory.c_str()) == 0) {
+#else
+    if (!error && lexical_parent == output_directory) {
+#endif
+        return true;
+    }
+    error.clear();
+    const auto parent = std::filesystem::weakly_canonical(path.parent_path(), error);
+#ifdef _WIN32
+    return !error && _wcsicmp(parent.c_str(), canonical_output.c_str()) == 0;
+#else
+    return !error && parent == canonical_output;
+#endif
 }
+
+bool IsLinkedDirectory(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    std::error_code error;
+    return std::filesystem::is_symlink(path, error);
+#endif
+}
+
+struct ReadJob {
+    std::filesystem::path source;
+    std::filesystem::path relative;
+};
+
+// Only the enumerator touches directory state. Readers own independent result buffers.
+class TextReaders {
+public:
+    explicit TextReaders(const ScannerConfig& config)
+        : max_file_size_(config.max_file_size),
+          results_(std::clamp<std::size_t>(config.worker_count == 0
+              ? std::clamp(std::thread::hardware_concurrency(), 2u, 4u) : config.worker_count,
+              1, 8)) {
+        if (results_.size() == 1) {
+            return;
+        }
+        try {
+            for (std::size_t index = 0; index < results_.size(); ++index) {
+                threads_.emplace_back([this, index] { Run(results_[index]); });
+            }
+        } catch (...) {
+            Close();
+            throw;
+        }
+    }
+
+    ~TextReaders() { Close(); }
+
+    void Add(ReadJob job) {
+        if (threads_.empty()) {
+            Read(std::move(job), results_.front());
+            return;
+        }
+        std::unique_lock lock(mutex_);
+        ready_.wait(lock, [this] { return failure_ || jobs_.size() < 64; });
+        if (failure_) {
+            std::rethrow_exception(failure_);
+        }
+        jobs_.push_back(std::move(job));
+        lock.unlock();
+        ready_.notify_all();
+    }
+
+    void Finish(ScanResult& result) {
+        Close();
+        if (failure_) {
+            std::rethrow_exception(failure_);
+        }
+        for (auto& buffer : results_) {
+            result.text_files.insert(result.text_files.end(),
+                std::make_move_iterator(buffer.text_files.begin()),
+                std::make_move_iterator(buffer.text_files.end()));
+            result.warnings.insert(result.warnings.end(),
+                std::make_move_iterator(buffer.warnings.begin()),
+                std::make_move_iterator(buffer.warnings.end()));
+        }
+    }
+
+private:
+    void Read(ReadJob job, ScanResult& buffer) {
+        auto read = FileReader::ReadTextFile(job.source, max_file_size_);
+        if (read.success) {
+            buffer.text_files.emplace_back(std::move(job.relative),
+                read.text.source_encoding, std::move(read.text.utf8));
+        } else if (read.error_message != "Binary or non-text content") {
+            const auto warning = "Skipped " + job.source.filename().string() +
+                                 ": " + read.error_message;
+            LOG_WARN("{}", warning);
+            buffer.warnings.push_back(warning);
+        }
+    }
+
+    void Run(ScanResult& buffer) {
+        try {
+            for (;;) {
+                std::unique_lock lock(mutex_);
+                ready_.wait(lock, [this] { return failure_ || finished_ || !jobs_.empty(); });
+                if (failure_ || jobs_.empty()) {
+                    return;
+                }
+                auto job = std::move(jobs_.front());
+                jobs_.pop_front();
+                lock.unlock();
+                ready_.notify_all();
+                Read(std::move(job), buffer);
+            }
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                failure_ = std::current_exception();
+            }
+            ready_.notify_all();
+        }
+    }
+
+    void Close() {
+        {
+            std::lock_guard lock(mutex_);
+            finished_ = true;
+        }
+        ready_.notify_all();
+        threads_.clear();  // jthread joins before buffers or synchronization are destroyed.
+    }
+
+    std::uintmax_t max_file_size_;
+    std::vector<ScanResult> results_;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<ReadJob> jobs_;
+    bool finished_ = false;
+    std::exception_ptr failure_;
+    std::vector<std::jthread> threads_;
+};
 
 }  // namespace
 
@@ -94,22 +238,24 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
             return result;
         }
 
+        const auto output = std::filesystem::absolute(output_directory).lexically_normal();
+        const auto canonical_output = std::filesystem::weakly_canonical(output, ec);
+        ec.clear();
+        TextReaders readers(config);
         const std::filesystem::recursive_directory_iterator end;
-        for (; it != end; it.increment(ec)) {
-            if (ec) {
-                // skip_permission_denied handles most cases, so this is rare.
-                LOG_WARN("Aborting traversal at {}: {}",
-                         it->path().string(), ec.message());
-                result.warnings.push_back("Traversal aborted: " +
-                                          it->path().string() + " (" +
-                                          ec.message() + ")");
-                break;
-            }
-
+        for (; !ec && it != end; it.increment(ec)) {
             const auto& entry = *it;
             const auto& path = entry.path();
 
-            if (!entry.is_directory() && IsGeneratedReport(path, output_directory)) {
+            const auto relative = path.lexically_relative(project_root);
+            const bool is_directory = entry.is_directory(ec);
+            if (ec) {
+                result.warnings.push_back("Cannot inspect entry: " + path.string());
+                ec.clear();
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (!is_directory && IsGeneratedReport(path, output, canonical_output)) {
                 ++result.scanned_files;
                 continue;
             }
@@ -117,27 +263,31 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
             // Build ProjectEntry regardless of file/dir
             {
                 ProjectEntry pe;
-                pe.relative_path = path.lexically_relative(project_root);
-                pe.is_directory = entry.is_directory();
+                pe.relative_path = relative;
+                pe.is_directory = is_directory;
                 result.entries.push_back(std::move(pe));
             }
 
-            if (entry.is_directory()) {
-                if (ShouldSkipDirectory(path)) {
+            if (is_directory) {
+                if (ShouldSkipDirectory(path) || IsLinkedDirectory(path)) {
                     it.disable_recursion_pending();
                     LOG_DEBUG("Skipping directory: {}", path.string());
                 }
                 continue;
             }
 
+            ++result.scanned_files;
+            // Never read special files or follow file links outside the selected tree.
+            if (entry.is_symlink(ec) || !entry.is_regular_file(ec) || ec) {
+                ec.clear();
+                continue;
+            }
             // Skip dotfiles and known binary extensions
             const auto filename = path.filename().string();
             if (!filename.empty() && filename.front() == '.') {
-                ++result.scanned_files;
                 continue;
             }
             if (HasBinaryExtension(path)) {
-                ++result.scanned_files;
                 continue;
             }
 
@@ -146,7 +296,6 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
             const auto size = entry.file_size(size_ec);
             if (size_ec) {
                 LOG_WARN("Cannot read file size: {}", path.string());
-                ++result.scanned_files;
                 continue;
             }
             if (size > config.max_file_size) {
@@ -154,30 +303,15 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
                          size, config.max_file_size, path.string());
                 result.warnings.push_back("Skipping large file: " +
                                           path.filename().string());
-                ++result.scanned_files;
                 continue;
             }
 
-            // Read and decode text file
-            const auto file_result = FileReader::ReadTextFile(path);
-            if (!file_result.success) {
-                LOG_WARN("Skipping file ({}): {}",
-                         file_result.error_message, path.string());
-                if (file_result.error_message != "Binary or non-text content") {
-                    result.warnings.push_back(
-                        "Skipped " + path.filename().string() +
-                        ": " + file_result.error_message);
-                }
-                ++result.scanned_files;
-                continue;
-            }
-
-            result.text_files.push_back(
-                FileItem{path.lexically_relative(project_root),
-                         file_result.text.source_encoding,
-                         file_result.text.utf8});
-            ++result.scanned_files;
+            readers.Add({path, relative});
         }
+        if (ec) {
+            result.warnings.push_back("Traversal aborted: " + ec.message());
+        }
+        readers.Finish(result);
 
         std::sort(result.entries.begin(), result.entries.end(),
                   [](const ProjectEntry& left, const ProjectEntry& right) {
@@ -189,6 +323,7 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
                       return left.relative_path.generic_u8string() <
                              right.relative_path.generic_u8string();
                   });
+        std::sort(result.warnings.begin(), result.warnings.end());
 
         LOG_INFO("Scan complete: {} files scanned, {} text files found",
                  result.scanned_files, result.text_files.size());

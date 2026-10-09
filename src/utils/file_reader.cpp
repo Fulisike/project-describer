@@ -6,22 +6,32 @@
 
 namespace project_describer {
 
-FileReadResult FileReader::ReadTextFile(const std::filesystem::path& path) {
+FileReadResult FileReader::ReadTextFile(const std::filesystem::path& path,
+                                       std::uintmax_t max_file_size) {
     FileReadResult result;
-    std::error_code error;
-    const auto file_size = std::filesystem::file_size(path, error);
-    if (error) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) {
+        result.error_message = "Cannot open file";
+        return result;
+    }
+    const auto end = input.tellg();
+    if (end < 0) {
         result.error_message = "Cannot determine file size";
         return result;
     }
-    if (file_size > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max())) {
+    const auto file_size = static_cast<std::uintmax_t>(end);
+    if (file_size > max_file_size) {
+        result.error_message = "File exceeds size limit";
+        return result;
+    }
+    if (file_size > static_cast<std::uintmax_t>((std::numeric_limits<std::size_t>::max)()) ||
+        file_size > static_cast<std::uintmax_t>((std::numeric_limits<std::streamsize>::max)())) {
         result.error_message = "File is too large for this process";
         return result;
     }
-
-    std::ifstream input(path, std::ios::binary);
+    input.seekg(0);
     if (!input) {
-        result.error_message = "Cannot open file";
+        result.error_message = "Cannot seek file";
         return result;
     }
 
@@ -38,14 +48,14 @@ FileReadResult FileReader::ReadTextFile(const std::filesystem::path& path) {
         result.error_message = "Binary or non-text content";
         return result;
     }
-    const auto decoded = EncodingUtils::DecodeToUtf8(bytes);
+    auto decoded = EncodingUtils::DecodeToUtf8(bytes);
     if (!decoded) {
         result.error_message = "Unsupported or invalid text encoding";
         return result;
     }
 
     result.success = true;
-    result.text = *decoded;
+    result.text = std::move(*decoded);
     return result;
 }
 

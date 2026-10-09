@@ -6,9 +6,8 @@
 
 namespace project_describer {
 
-// Discovers the text files that Codex and Claude Code use as durable context.
-// Authentication data, conversation transcripts, logs, and caches are
-// intentionally outside this boundary.
+// Discovers durable instructions and readable local session transcripts.
+// Credential files, logs, and caches are outside this boundary.
 class ContextLoader {
 public:
     static ScanResult LoadCodex(const std::filesystem::path& project_root);

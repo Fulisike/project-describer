@@ -26,6 +26,7 @@ add_library(project_describer_core
     src/core/context_loader.cpp
     src/core/report_writer.cpp
     src/core/scanner.cpp
+    src/core/session_loader.cpp
     src/model/text_encoding.cpp
     src/utils/encoding.cpp
     src/utils/file_reader.cpp
@@ -37,15 +38,19 @@ target_include_directories(project_describer_core
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cxxopts"
+    PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/json"
 )
 target_link_libraries(project_describer_core
     PUBLIC
         spdlog::spdlog_header_only
 )
+find_package(Threads REQUIRED)
+target_link_libraries(project_describer_core PUBLIC Threads::Threads)
 target_compile_features(project_describer_core PUBLIC cxx_std_20)
 
 if(MSVC)
-    target_compile_options(project_describer_core PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(project_describer_core PRIVATE /W4 /permissive- PUBLIC /utf-8)
 else()
     target_compile_options(project_describer_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
@@ -71,6 +76,14 @@ if(BUILD_TESTING AND PROJECT_DESCRIBER_BUILD_TESTS)
     )
     target_link_libraries(project-describer-tests PRIVATE project_describer_core)
     add_test(NAME project-describer-tests COMMAND project-describer-tests)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-temp")
+    set_tests_properties(project-describer-tests PROPERTIES
+        ENVIRONMENT "TEMP=${CMAKE_BINARY_DIR}/test-temp;TMP=${CMAKE_BINARY_DIR}/test-temp")
+
+    add_executable(project-describer-scan-benchmark EXCLUDE_FROM_ALL
+        tests/benchmark_scanner.cpp
+    )
+    target_link_libraries(project-describer-scan-benchmark PRIVATE project_describer_core)
 endif()
 
 # ===========================================================================
@@ -112,6 +125,19 @@ if(PROJECT_DESCRIBER_BUILD_GUI)
             project_describer_core
             Qt6::Widgets
     )
+
+    if(BUILD_TESTING AND PROJECT_DESCRIBER_BUILD_TESTS)
+        add_executable(project-describer-gui-tests
+            tests/test_gui.cpp
+            src/gui/main_window.cpp
+        )
+        target_link_libraries(project-describer-gui-tests PRIVATE
+            project_describer_core Qt6::Widgets)
+        add_dependencies(project-describer-gui-tests project-describer-gui)
+        add_test(NAME project-describer-gui-tests COMMAND project-describer-gui-tests)
+        set_tests_properties(project-describer-gui-tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;TEMP=${CMAKE_BINARY_DIR}/test-temp;TMP=${CMAKE_BINARY_DIR}/test-temp")
+    endif()
 
     # --- windeployqt post-build step ---
     if(_windeployqt_executable)

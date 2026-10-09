@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <QtCore/QThread>
 
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QLabel>
@@ -56,6 +57,7 @@ private:
     ScanResult       loaded_scan_;
     QString          loaded_project_path_;
     bool             updating_checks_     = false;
+    QThread*         load_thread_         = nullptr;
 };
 
 }  // namespace project_describer::gui
