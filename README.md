@@ -61,6 +61,10 @@ The GUI separates loading from exporting:
 2. Click **Load / Refresh** and expand or collapse the resulting hierarchy.
 3. Check only the files that should be included, then click **Export selected files**.
 
+The **每个文件前 N 行** field limits each selected file's exported content to its
+first N lines. Empty lines count as lines; files shorter than N lines are included
+in full. Leave the field empty or click **默认（全文）** to export all content.
+
 Codex discovery covers layered `AGENTS.md`/`AGENTS.override.md` instructions,
 configured fallback instruction names, user and project configuration, local skills,
 and local memories. Claude Code discovery covers managed, user, and project

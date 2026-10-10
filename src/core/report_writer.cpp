@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+#include <string_view>
 #include <system_error>
 
 #include "model/text_encoding.hpp"
@@ -28,10 +29,26 @@ std::string DirectoryLine(const ProjectEntry& entry) {
     return line;
 }
 
+std::string_view FirstLines(std::string_view content, std::size_t max_lines) {
+    if (max_lines == 0) {
+        return content;
+    }
+    std::size_t end = 0;
+    for (std::size_t line = 0; line < max_lines; ++line) {
+        end = content.find('\n', end);
+        if (end == std::string_view::npos) {
+            return content;
+        }
+        ++end;
+    }
+    return content.substr(0, end);
+}
+
 }  // namespace
 
 std::string ReportWriter::Render(const std::filesystem::path& project_root,
-                                 const ScanResult& scan_result) {
+                                 const ScanResult& scan_result,
+                                 std::size_t max_lines_per_file) {
     LOG_DEBUG("Rendering report for project: {}", project_root.string());
     std::ostringstream report;
     try {
@@ -44,14 +61,18 @@ std::string ReportWriter::Render(const std::filesystem::path& project_root,
         }
         report << "\n## Text File Contents\n";
         report << "Text files included: " << scan_result.text_files.size() << "\n\n";
+        if (max_lines_per_file != 0) {
+            report << "Content limit: first " << max_lines_per_file << " lines per file\n\n";
+        }
 
         for (const auto& file : scan_result.text_files) {
             report << "<<< FILE START: " << DisplayPath(file.relative_path) << " >>>\n";
             report << "File name: " << file.file_name << '\n';
             report << "Detected encoding: " << EncodingName(file.source_encoding) << "\n";
             report << "--- CONTENT ---\n";
-            report << file.content;
-            if (!file.content.empty() && file.content.back() != '\n') {
+            const auto content = FirstLines(file.content, max_lines_per_file);
+            report << content;
+            if (!content.empty() && content.back() != '\n') {
                 report << '\n';
             }
             report << "<<< FILE END: " << DisplayPath(file.relative_path) << " >>>\n\n";

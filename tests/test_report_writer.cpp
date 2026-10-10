@@ -52,3 +52,29 @@ TEST(ChoosesIncrementingOutputNameAndWritesContent) {
     std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     EXPECT_EQ(content, std::string("report content"));
 }
+
+TEST(LimitsEachFileIndependentlyAndKeepsShortFiles) {
+    project_describer::ScanResult scan;
+    scan.text_files.emplace_back("lf.txt", project_describer::TextEncoding::kUtf8,
+                                 "first\n\nthird\nfourth");
+    scan.text_files.emplace_back("crlf.txt", project_describer::TextEncoding::kUtf8,
+                                 "alpha\r\nbeta\r\ngamma\r\n");
+    scan.text_files.emplace_back("short.txt", project_describer::TextEncoding::kUtf8,
+                                 "short without newline");
+    scan.text_files.emplace_back("empty.txt", project_describer::TextEncoding::kUtf8, "");
+
+    const auto limited = project_describer::ReportWriter::Render("demo", scan, 2);
+    EXPECT_TRUE(limited.find("first\n\n<<< FILE END: lf.txt >>>") != std::string::npos);
+    EXPECT_TRUE(limited.find("alpha\r\nbeta\r\n<<< FILE END: crlf.txt >>>") != std::string::npos);
+    EXPECT_TRUE(limited.find("short without newline\n<<< FILE END: short.txt >>>") != std::string::npos);
+    EXPECT_TRUE(limited.find("third") == std::string::npos);
+    EXPECT_TRUE(limited.find("gamma") == std::string::npos);
+    EXPECT_TRUE(limited.find("<<< FILE END: empty.txt >>>") != std::string::npos);
+
+    const auto full = project_describer::ReportWriter::Render("demo", scan);
+    EXPECT_EQ(project_describer::ReportWriter::Render("demo", scan, 0), full);
+    EXPECT_TRUE(full.find("third\nfourth") != std::string::npos);
+    EXPECT_TRUE(project_describer::ReportWriter::Render("demo", scan, 100).find(
+                    "alpha\r\nbeta\r\ngamma\r\n") != std::string::npos);
+    EXPECT_EQ(scan.text_files.front().content, std::string("first\n\nthird\nfourth"));
+}

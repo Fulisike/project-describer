@@ -40,6 +40,8 @@ private:
 
     QLineEdit*       project_path_edit_   = nullptr;
     QLineEdit*       output_path_edit_    = nullptr;
+    QLineEdit*       file_line_limit_edit_ = nullptr;
+    QPushButton*     reset_line_limit_btn_ = nullptr;
     QPushButton*     browse_project_btn_  = nullptr;
     QPushButton*     browse_output_btn_   = nullptr;
     QPushButton*     load_btn_            = nullptr;

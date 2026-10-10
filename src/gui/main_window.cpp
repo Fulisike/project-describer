@@ -5,6 +5,7 @@
 #include <exception>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -12,6 +13,7 @@
 #include <QtCore/QDir>
 #include <QtCore/QHash>
 #include <QtGui/QStandardItem>
+#include <QtGui/QIntValidator>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QHBoxLayout>
@@ -184,6 +186,23 @@ void MainWindow::SetupUI() {
                     static_cast<qsizetype>(file.content.size())));
             }
         });
+    }
+    {
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel("每个文件前 N 行：", central));
+        file_line_limit_edit_ = new QLineEdit(central);
+        file_line_limit_edit_->setObjectName("file_line_limit");
+        file_line_limit_edit_->setPlaceholderText("默认：全文");
+        file_line_limit_edit_->setMaximumWidth(130);
+        file_line_limit_edit_->setValidator(new QIntValidator(
+            1, (std::numeric_limits<int>::max)(), file_line_limit_edit_));
+        row->addWidget(file_line_limit_edit_);
+        reset_line_limit_btn_ = new QPushButton("默认（全文）", central);
+        connect(reset_line_limit_btn_, &QPushButton::clicked,
+                file_line_limit_edit_, &QLineEdit::clear);
+        row->addWidget(reset_line_limit_btn_);
+        row->addStretch(1);
+        layout->addLayout(row);
     }
     {
         auto* row = new QHBoxLayout;
@@ -440,6 +459,18 @@ void MainWindow::OnStart() {
         return;
     }
 
+    std::size_t max_lines_per_file = 0;
+    const auto line_limit = file_line_limit_edit_->text().trimmed();
+    if (!line_limit.isEmpty()) {
+        bool valid = false;
+        const int lines = line_limit.toInt(&valid);
+        if (!valid || lines < 1) {
+            QMessageBox::warning(this, "无效行数", "请输入正整数，或选择“默认（全文）”。");
+            return;
+        }
+        max_lines_per_file = static_cast<std::size_t>(lines);
+    }
+
     std::vector<std::size_t> selected_indices;
     std::function<void(QStandardItem*)> collect = [&](QStandardItem* parent) {
         for (int row = 0; row < parent->rowCount(); ++row) {
@@ -483,7 +514,7 @@ void MainWindow::OnStart() {
         }
 
         const auto project_root = PathFromQString(project_path_edit_->text());
-        const auto report = ReportWriter::Render(project_root, selected);
+        const auto report = ReportWriter::Render(project_root, selected, max_lines_per_file);
         const auto output_path = ReportWriter::ChooseOutputPath(output_dir);
         std::string write_error;
         if (!ReportWriter::WriteUtf8(output_path, report, write_error)) {
@@ -514,6 +545,8 @@ void MainWindow::SetBusy(bool busy) {
     browse_output_btn_->setEnabled(!busy);
     project_path_edit_->setEnabled(!busy);
     output_path_edit_->setEnabled(!busy);
+    file_line_limit_edit_->setEnabled(!busy);
+    reset_line_limit_btn_->setEnabled(!busy);
     tree_view_->setEnabled(!busy);
     project_files_check_->setEnabled(!busy);
     codex_context_check_->setEnabled(!busy);
