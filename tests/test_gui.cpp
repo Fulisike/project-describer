@@ -46,7 +46,7 @@ QStandardItem* Find(QStandardItem* parent, const QString& label) {
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
     project_describer::log::Initialize(project_describer::log::Mode::kCli,
-                                       std::filesystem::temp_directory_path().string());
+                                       std::filesystem::temp_directory_path());
     QTemporaryDir temporary;
     EXPECT_TRUE(temporary.isValid());
     const std::filesystem::path root(temporary.path().toStdWString());
@@ -101,13 +101,71 @@ int main(int argc, char** argv) {
         if (codex_session && claude_session) {
             tree->setCurrentIndex(codex_session->index());
             EXPECT_TRUE(window.findChild<QTextEdit*>()->toPlainText().contains("你好 GUI context"));
+            codex_session->parent()->setCheckState(Qt::Unchecked);
+            EXPECT_EQ(codex_session->checkState(), Qt::Unchecked);
+            codex_session->parent()->setCheckState(Qt::Checked);
+            EXPECT_EQ(codex_session->checkState(), Qt::Checked);
             claude_session->setCheckState(Qt::Unchecked);
             Button(window, "导出所选文件")->click();
+            EXPECT_TRUE(!load->isEnabled());
+            deadline.restart();
+            while (!load->isEnabled() && deadline.elapsed() < 10000) {
+                QApplication::processEvents();
+                QThread::msleep(1);
+            }
+            EXPECT_TRUE(load->isEnabled());
             std::ifstream report(project / "describer.txt", std::ios::binary);
             const std::string content((std::istreambuf_iterator<char>(report)), {});
             EXPECT_TRUE(content.find("GUI context") != std::string::npos);
             EXPECT_TRUE(content.find("excluded Claude transcript") == std::string::npos);
+            fields[0]->setText(fields[0]->text() + "/.");
+            EXPECT_TRUE(!Button(window, "导出所选文件")->isEnabled());
         }
+    }
+    {
+        Write(project / "Codex" / "source.txt", "project file named like a context root");
+        Write(project / "line-limit.txt", "first\nsecond\nthird\n");
+        project_describer::gui::MainWindow window;
+        const auto fields = window.findChildren<QLineEdit*>();
+        fields[0]->setText(QString::fromStdWString(project.wstring()));
+        fields[1]->setText(QString::fromStdWString(project.wstring()));
+        auto* load = Button(window, "加载 / 刷新");
+        load->click();
+        QElapsedTimer deadline;
+        deadline.start();
+        while (!load->isEnabled() && deadline.elapsed() < 10000) {
+            QApplication::processEvents();
+            QThread::msleep(1);
+        }
+        auto* tree = window.findChild<QTreeView*>();
+        auto* model = qobject_cast<QStandardItemModel*>(tree->model());
+        auto* source = Find(model->invisibleRootItem(), "source.txt");
+        EXPECT_TRUE(source != nullptr);
+        if (source) {
+            EXPECT_TRUE(source->parent() && source->parent()->parent());
+            if (source->parent() && source->parent()->parent()) {
+                EXPECT_EQ(source->parent()->parent()->text(), QString("项目文件"));
+            }
+        }
+        Button(window, "全不选")->click();
+        auto* limited = Find(model->invisibleRootItem(), "line-limit.txt");
+        EXPECT_TRUE(limited != nullptr);
+        if (limited) limited->setCheckState(Qt::Checked);
+        window.findChild<QLineEdit*>("file_line_limit")->setText("2");
+        Button(window, "导出所选文件")->click();
+        deadline.restart();
+        while (!load->isEnabled() && deadline.elapsed() < 10000) {
+            QApplication::processEvents();
+            QThread::msleep(1);
+        }
+        std::ifstream report(project / "describer1.txt", std::ios::binary);
+        const std::string content((std::istreambuf_iterator<char>(report)), {});
+        EXPECT_TRUE(content.find("first\nsecond\n") != std::string::npos);
+        EXPECT_TRUE(content.find("third") == std::string::npos);
+        for (auto* checkbox : window.findChildren<QCheckBox*>()) {
+            if (checkbox->text() == "Codex 上下文") checkbox->setChecked(true);
+        }
+        EXPECT_TRUE(!Button(window, "导出所选文件")->isEnabled());
     }
     project_describer::log::Shutdown();
     return test::Failures() == 0 ? 0 : 1;

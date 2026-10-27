@@ -57,9 +57,10 @@ private:
     QLabel*          status_label_        = nullptr;
     QProgressBar*    progress_bar_        = nullptr;
     ScanResult       loaded_scan_;
+    std::size_t      loaded_project_file_count_ = 0;
     QString          loaded_project_path_;
     bool             updating_checks_     = false;
-    QThread*         load_thread_         = nullptr;
+    QThread*         worker_thread_         = nullptr;
 };
 
 }  // namespace project_describer::gui

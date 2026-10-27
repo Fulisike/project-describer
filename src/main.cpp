@@ -26,7 +26,7 @@ int Run(const int argc, const char* const argv[]) {
     // Initialize logging — file goes next to the executable
     project_describer::log::Initialize(
         project_describer::log::Mode::kCli,
-        std::filesystem::current_path().string());
+        std::filesystem::current_path());
 
     project_describer::SetUserErrorCallback(&CliErrorMessage);
     project_describer::SetUserInfoCallback(&CliInfoMessage);

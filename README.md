@@ -17,8 +17,9 @@ ctest --test-dir build -C Debug --output-on-failure
 ```
 
 The executable is `build/Debug/project-describer.exe` for the Visual Studio generator.
-For a single distributable executable, build `Release` and copy
-`build/Release/project-describer.exe`.
+For a Release CLI build, copy `build/Release/project-describer.exe`. The MSVC
+build requires the matching Microsoft Visual C++ Redistributable on the target
+computer. GUI distributions also need the deployed Qt DLLs and plugins.
 
 The Qt GUI executable is `build/Debug/project-describer-gui.exe`. Its window and
 Windows executable icon are built from `pd.ico`.
@@ -86,7 +87,7 @@ the current model context: compaction, encrypted reasoning, images, referenced
 history, and cloud-only sessions can prevent that. Oversized or malformed records
 produce visible warnings. See [the format investigation](docs/session-context-research.md).
 
-Loading runs in the background. Project scanning pipelines directory enumeration
+Loading and exporting run in the background. Project scanning pipelines directory enumeration
 through a bounded 64-job queue to up to four reading/decoding workers, then sorts
 the results. Directory links/junctions and file symlinks are not followed. Files
 retain the 1 MiB limit, checked again when opened; session records are capped at
@@ -120,3 +121,6 @@ changing scanning or report generation.
 
 See [the architecture notes](docs/architecture.md) and
 [the engineering guide](docs/engineering-guide.md).
+
+The [2026-10-26 bug audit](docs/bug-audit-2026-10-26.md) lists confirmed defects,
+their fixes, regression results, and verification limits.

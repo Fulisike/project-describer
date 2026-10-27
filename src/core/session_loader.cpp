@@ -10,10 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#endif
+#include "utils/path_utils.hpp"
 
 namespace project_describer {
 namespace {
@@ -98,7 +95,11 @@ bool ReadLine(std::istream& input, std::string& line, std::size_t& remaining) {
 Json Parse(const std::string& line) {
     // Local transcripts are UTF-8 JSONL; the parser decodes escapes and surrogate pairs.
     const auto offset = line.starts_with("\xEF\xBB\xBF") ? 3 : 0;
-    return Json::parse(line.begin() + offset, line.end(), nullptr, false);
+    return Json::parse(line.begin() + offset, line.end(),
+        [](int depth, Json::parse_event_t, Json&) {
+            if (depth > 128) throw std::runtime_error("Session JSON nesting exceeds 128 levels");
+            return true;
+        }, false);
 }
 
 Json ReadMetadata(const std::filesystem::path& path, bool codex) {
@@ -127,7 +128,7 @@ std::string Pretty(const Json& value) {
     }
     if (value.is_string()) {
         const auto text = value.get<std::string>();
-        const auto decoded = Json::parse(text, nullptr, false);
+        const auto decoded = Parse(text);
         return decoded.is_object() || decoded.is_array() ? decoded.dump(2) : text;
     }
     return value.dump(2);
@@ -161,6 +162,12 @@ std::string Content(const Json& value) {
                Content(Field(value, "content"));
     }
     return Pretty(value);
+}
+
+std::string MessageKey(std::string text) {
+    const auto end = text.find_last_not_of("\r\n");
+    text.resize(end == std::string::npos ? 0 : end + 1);
+    return text;
 }
 
 std::string RenderCodex(const Json& record) {
@@ -262,8 +269,14 @@ void AppendSession(ScanResult& result, const std::filesystem::path& source,
         "\nThis is a readable local transcript, not an exact reconstruction of the current model context.\n";
     std::string line;
     std::size_t malformed = 0;
-    std::size_t response_messages = 0;
-    std::string fallback_messages;
+    std::multiset<std::pair<std::string, std::string>> response_messages;
+    struct EventMessage {
+        std::size_t offset;
+        std::pair<std::string, std::string> key;
+        std::string rendered;
+    };
+    std::vector<EventMessage> fallback_messages;
+    std::size_t fallback_bytes = 0;
     while (ReadLine(input, line, remaining)) {
         if (line.empty() || line == "\r") {
             continue;
@@ -275,22 +288,41 @@ void AppendSession(ScanResult& result, const std::filesystem::path& source,
         }
         if (codex && String(record, "type") == "response_item" &&
             String(Field(record, "payload"), "type") == "message") {
-            ++response_messages;
+            const auto& payload = Field(record, "payload");
+            response_messages.emplace(String(payload, "role"), MessageKey(Content(Field(payload, "content"))));
         }
         if (codex && String(record, "type") == "event_msg") {
             const auto& payload = Field(record, "payload");
             const auto type = String(payload, "type");
             if (type == "user_message" || type == "agent_message") {
-                fallback_messages += "\n## " + type + "\n\n" + String(payload, "message") + "\n";
+                auto message = "\n## " + type + "\n\n" + String(payload, "message") + "\n";
+                fallback_bytes += message.size();
+                fallback_messages.push_back({text.size(),
+                    {type == "user_message" ? "user" : "assistant", MessageKey(String(payload, "message"))},
+                    std::move(message)});
             }
         }
         text += codex ? RenderCodex(record) : RenderClaude(record);
-        if (text.size() + fallback_messages.size() > kMaxSessionBytes) {
+        if (text.size() + fallback_bytes > kMaxSessionBytes) {
             throw std::runtime_error("Rendered session exceeds 64 MiB limit");
         }
     }
-    if (response_messages == 0) {
-        text += fallback_messages;
+    if (!fallback_messages.empty()) {
+        std::string combined;
+        combined.reserve(text.size() + fallback_bytes);
+        std::size_t previous = 0;
+        for (const auto& event : fallback_messages) {
+            const auto duplicate = response_messages.find(event.key);
+            if (duplicate != response_messages.end()) {
+                response_messages.erase(duplicate);
+                continue;
+            }
+            combined.append(text, previous, event.offset - previous);
+            combined += event.rendered;
+            previous = event.offset;
+        }
+        combined.append(text, previous);
+        text = std::move(combined);
     }
     if (remaining != 0) {
         const auto warning = "Session changed or could not be read completely: " + PathText(source);
@@ -310,6 +342,11 @@ void AppendSession(ScanResult& result, const std::filesystem::path& source,
     }
     display /= project.filename().empty() ? std::filesystem::path("Project") : project.filename();
     display /= Utf8Path(SafeName(id) + ".md");
+    const auto directory = display.parent_path();
+    for (std::size_t suffix = 1; std::any_of(result.text_files.begin(), result.text_files.end(),
+             [&](const FileItem& file) { return file.relative_path == display; }); ++suffix) {
+        display = directory / Utf8Path(SafeName(id) + "-" + std::to_string(suffix) + ".md");
+    }
     result.text_files.emplace_back(display, TextEncoding::kUtf8, std::move(text));
     seen.insert(id);
     std::filesystem::path current;

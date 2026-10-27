@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <filesystem>
 #include <string>
 
 #include <spdlog/spdlog.h>
@@ -10,7 +11,7 @@ namespace project_describer::log {
 enum class Mode { kCli, kGui };
 
 /// Call once at startup, before any other logging operation.
-void Initialize(Mode mode, const std::string& log_dir);
+void Initialize(Mode mode, const std::filesystem::path& log_dir);
 void Shutdown();
 
 /// The project-wide spdlog logger instance.

@@ -40,6 +40,13 @@ ParseResult ParseCommandLine(int argc, const char* const argv[]) {
         if (!parsed.count("path")) {
             return {ParseStatus::kError, std::nullopt, "-p / --path is required."};
         }
+        if (!parsed.unmatched().empty()) {
+            return {ParseStatus::kError, std::nullopt, "Unexpected positional argument: " + parsed.unmatched().front()};
+        }
+        if (parsed["path"].as<std::string>().empty() ||
+            (parsed.count("output") && parsed["output"].as<std::string>().empty())) {
+            return {ParseStatus::kError, std::nullopt, "Directory paths must not be empty."};
+        }
 
         CommandLineOptions options{PathFromUtf8(parsed["path"].as<std::string>()), std::nullopt};
         if (parsed.count("output")) {

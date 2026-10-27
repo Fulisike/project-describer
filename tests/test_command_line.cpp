@@ -25,3 +25,17 @@ TEST(RecognizesHelp) {
 
     EXPECT_EQ(result.status, project_describer::ParseStatus::kHelpRequested);
 }
+
+TEST(RejectsUnexpectedPositionalArgumentsAndEmptyPaths) {
+    for (const auto* path : {"", "demo"}) {
+        const char* arguments[] = {"project-describer", "-p", path, "unexpected"};
+        EXPECT_EQ(project_describer::ParseCommandLine(4, arguments).status,
+                  project_describer::ParseStatus::kError);
+    }
+    const char* empty_project[] = {"project-describer", "-p", ""};
+    EXPECT_EQ(project_describer::ParseCommandLine(3, empty_project).status,
+              project_describer::ParseStatus::kError);
+    const char* empty_output[] = {"project-describer", "-p", "demo", "-o", ""};
+    EXPECT_EQ(project_describer::ParseCommandLine(5, empty_output).status,
+              project_describer::ParseStatus::kError);
+}

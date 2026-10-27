@@ -5,6 +5,7 @@
 #include "core/report_writer.hpp"
 #include "core/scanner.hpp"
 #include "utils/logging.hpp"
+#include "utils/path_utils.hpp"
 #include "utils/user_notifier.hpp"
 
 namespace project_describer {
@@ -19,9 +20,9 @@ int RunProjectDescriber(const CommandLineOptions& options, std::ostream& output,
         // Validate project root
         if (!std::filesystem::is_directory(options.project_root, ec) || ec) {
             const auto msg = "Error: Project root is not a readable directory:\n  " +
-                             options.project_root.string();
+                             PathToUtf8(options.project_root);
             errors << msg << '\n';
-            NotifyUserError("Invalid project root", options.project_root.string());
+            NotifyUserError("Invalid project root", PathToUtf8(options.project_root));
             return 2;
         }
 
@@ -29,9 +30,9 @@ int RunProjectDescriber(const CommandLineOptions& options, std::ostream& output,
         const auto output_directory = options.output_directory.value_or(options.project_root);
         if (!std::filesystem::is_directory(output_directory, ec) || ec) {
             const auto msg = "Error: Output directory does not exist:\n  " +
-                             output_directory.string();
+                             PathToUtf8(output_directory);
             errors << msg << '\n';
-            NotifyUserError("Invalid output directory", output_directory.string());
+            NotifyUserError("Invalid output directory", PathToUtf8(output_directory));
             return 2;
         }
 
@@ -60,13 +61,13 @@ int RunProjectDescriber(const CommandLineOptions& options, std::ostream& output,
             return 1;
         }
 
-        output << "\nDone! Wrote: " << output_path.string() << '\n';
+        output << "\nDone! Wrote: " << PathToUtf8(output_path) << '\n';
         if (!scan_result.warnings.empty()) {
             output << "Warnings (" << scan_result.warnings.size()
                    << " total — see log for details)\n";
         }
-        LOG_INFO("All done: {}", output_path.string());
-        NotifyUserInfo("Report written to " + output_path.string());
+        LOG_INFO("All done: {}", PathToUtf8(output_path));
+        NotifyUserInfo("Report written to " + PathToUtf8(output_path));
         return 0;
 
     } catch (const std::bad_alloc& e) {

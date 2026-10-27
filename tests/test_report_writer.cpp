@@ -3,6 +3,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+#include <atomic>
 
 #include "core/report_writer.hpp"
 
@@ -77,4 +79,60 @@ TEST(LimitsEachFileIndependentlyAndKeepsShortFiles) {
     EXPECT_TRUE(project_describer::ReportWriter::Render("demo", scan, 100).find(
                     "alpha\r\nbeta\r\ngamma\r\n") != std::string::npos);
     EXPECT_EQ(scan.text_files.front().content, std::string("first\n\nthird\nfourth"));
+}
+
+TEST(ReportsFinalizeFailureAndCleansTemporaryFiles) {
+    ScopedOutputDirectory temp;
+    const auto destination = temp.path() / "describer.txt";
+    std::filesystem::create_directory(destination);
+    std::string error;
+    EXPECT_TRUE(!project_describer::ReportWriter::WriteUtf8(destination, "new", error));
+    EXPECT_TRUE(error.find("Success") == std::string::npos);
+    EXPECT_TRUE(error.find("成功") == std::string::npos);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(temp.path()),
+                            std::filesystem::directory_iterator{}), 1);
+}
+
+TEST(ConcurrentWritersNeverReplaceAnExistingReport) {
+    ScopedOutputDirectory temp;
+    const auto destination = temp.path() / "describer.txt";
+    std::atomic<int> successes = 0;
+    std::vector<std::jthread> writers;
+    for (int index = 0; index < 8; ++index) {
+        writers.emplace_back([&, index] {
+            std::string error;
+            if (project_describer::ReportWriter::WriteUtf8(
+                    destination, std::string(8192, static_cast<char>('a' + index)), error)) {
+                ++successes;
+                EXPECT_TRUE(error.empty());
+            }
+        });
+    }
+    writers.clear();
+    EXPECT_EQ(successes.load(), 1);
+    std::ifstream input(destination, std::ios::binary);
+    const std::string original((std::istreambuf_iterator<char>(input)), {});
+    input.close();
+    EXPECT_EQ(original.size(), std::size_t{8192});
+    EXPECT_TRUE(original == std::string(original.size(), original.front()));
+    std::string error;
+    EXPECT_TRUE(!project_describer::ReportWriter::WriteUtf8(destination, "replacement", error));
+    std::ifstream unchanged(destination, std::ios::binary);
+    EXPECT_EQ(std::string((std::istreambuf_iterator<char>(unchanged)), {}), original);
+}
+
+TEST(CountsCarriageReturnLinesAndReportsInvalidOutputDirectory) {
+    project_describer::ScanResult scan;
+    scan.text_files.emplace_back("old.txt", project_describer::TextEncoding::kUtf8,
+                                 "first\rsecond\rthird");
+    const auto report = project_describer::ReportWriter::Render("demo", scan, 2);
+    EXPECT_TRUE(report.find("third") == std::string::npos);
+    ScopedOutputDirectory temp;
+    bool rejected = false;
+    try {
+        project_describer::ReportWriter::ChooseOutputPath(temp.path() / "missing");
+    } catch (const std::filesystem::filesystem_error&) {
+        rejected = true;
+    }
+    EXPECT_TRUE(rejected);
 }

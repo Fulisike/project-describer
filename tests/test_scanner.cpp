@@ -128,3 +128,28 @@ TEST(ScanDoesNotFollowDirectoryJunctionsOrFileLinks) {
         EXPECT_EQ(result.text_files.size(), std::size_t{1});
     }
 }
+
+TEST(ScanHandlesUnicodePathsAndWindowsReportCase) {
+    ScopedDirectory temp;
+    const auto root = temp.path() / std::filesystem::path(u8"项目🚀");
+    Write(root / std::filesystem::path(u8"文件🚀.txt"), "unicode content");
+#ifdef _WIN32
+    Write(root / "DESCRIBER2.TXT", "old report");
+#endif
+    const auto result = project_describer::Scanner::Scan(root, root);
+    EXPECT_EQ(result.text_files.size(), std::size_t{1});
+    EXPECT_TRUE(result.warnings.empty());
+}
+
+TEST(DirectoryTreeKeepsChildrenBeforeSimilarlyNamedRootSiblings) {
+    ScopedDirectory temp;
+    Write(temp.path() / "a" / "child.txt", "nested");
+    Write(temp.path() / "a.txt", "sibling");
+    const auto result = project_describer::Scanner::Scan(temp.path(), temp.path());
+    EXPECT_EQ(result.entries.size(), std::size_t{3});
+    if (result.entries.size() == 3) {
+        EXPECT_EQ(result.entries[0].relative_path, std::filesystem::path("a"));
+        EXPECT_EQ(result.entries[1].relative_path, std::filesystem::path("a") / "child.txt");
+        EXPECT_EQ(result.entries[2].relative_path, std::filesystem::path("a.txt"));
+    }
+}

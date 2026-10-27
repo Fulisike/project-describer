@@ -218,11 +218,15 @@ bool EncodingUtils::IsLikelyText(const std::vector<std::uint8_t>& data) {
     }
     if (StartsWith(data, {0xFF, 0xFE, 0x00, 0x00}) ||
         StartsWith(data, {0x00, 0x00, 0xFE, 0xFF}) ||
-        StartsWith(data, {0xFF, 0xFE}) || StartsWith(data, {0xFE, 0xFF})) {
-        return true;
-    }
-    if (DetectUtf16LittleEndian(data).has_value()) {
-        return true;
+        StartsWith(data, {0xFF, 0xFE}) || StartsWith(data, {0xFE, 0xFF}) ||
+        DetectUtf16LittleEndian(data).has_value()) {
+        const auto decoded = DecodeToUtf8(data);
+        // Keep malformed text on the decoding-error path, but inspect valid
+        // Unicode for the same binary controls as ordinary UTF-8 text.
+        if (!decoded) return true;
+        const std::vector<std::uint8_t> utf8(decoded->utf8.begin(), decoded->utf8.end());
+        return std::find(utf8.begin(), utf8.end(), 0) == utf8.end() &&
+               !HasTooManyControlBytes(utf8);
     }
     if (std::find(data.begin(), data.end(), 0) != data.end()) {
         return false;

@@ -1,6 +1,7 @@
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QMessageBox>
 #include <QtGui/QIcon>
+#include <filesystem>
 
 #include "gui/main_window.hpp"
 #include "utils/logging.hpp"
@@ -22,8 +23,8 @@ void GuiInfoMessage(const std::string& message) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    QApplication app(argc, argv);
     try {
-        QApplication app(argc, argv);
         QApplication::setApplicationName("Project Describer");
         QApplication::setApplicationVersion("0.1.0");
         QApplication::setOrganizationName("ProjectDescriber");
@@ -32,7 +33,11 @@ int main(int argc, char* argv[]) {
         // Initialize logging — file goes next to the executable
         project_describer::log::Initialize(
             project_describer::log::Mode::kGui,
-            QApplication::applicationDirPath().toStdString());
+#ifdef _WIN32
+            std::filesystem::path(QApplication::applicationDirPath().toStdWString()));
+#else
+            std::filesystem::path(QApplication::applicationDirPath().toStdString()));
+#endif
 
         project_describer::SetUserErrorCallback(&GuiErrorMessage);
         project_describer::SetUserInfoCallback(&GuiInfoMessage);

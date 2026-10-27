@@ -7,9 +7,14 @@
 int main() {
     project_describer::log::Initialize(
         project_describer::log::Mode::kCli,
-        std::filesystem::temp_directory_path().string());
+        std::filesystem::temp_directory_path());
     for (const auto& test_case : test::Cases()) {
-        test_case.run();
+        try {
+            test_case.run();
+        } catch (const std::exception& error) {
+            ++test::Failures();
+            std::cerr << test_case.name << ": unexpected exception: " << error.what() << '\n';
+        }
     }
     project_describer::log::Shutdown();
     if (test::Failures() == 0) {

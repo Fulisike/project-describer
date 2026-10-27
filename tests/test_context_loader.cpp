@@ -124,7 +124,8 @@ TEST(LoadsClaudeContextAndFollowsImports) {
     WriteContext(project / "CLAUDE.md",
                  "Read @docs/guide.md before work.\n"
                  "`@docs/ignored.md`\n"
-                 "```text\n@docs/ignored.md\n```\n");
+                 "``@docs/ignored.md``\n"
+                 "```text\n~~~\n@docs/ignored.md\n```\n");
     WriteContext(project / "docs" / "guide.md", "imported guide");
     WriteContext(project / "docs" / "ignored.md", "not an import");
     WriteContext(project / ".claude" / "settings.json", "{}\n");
@@ -152,7 +153,7 @@ TEST(LoadsCodexSessionsByProjectAndDecodesMessagesAndTools) {
     WriteContext(codex / "auth.json", "credential must not be loaded");
     WriteContext(codex / "sessions" / "2026" / "10" / "09" / "first.jsonl",
         CodexMetadata(project, "session-a") +
-        R"({"type":"event_msg","payload":{"type":"user_message","message":"duplicate event"}})" "\n" +
+        R"({"type":"event_msg","payload":{"type":"user_message","message":"\u4f60\u597d\nworld \ud83d\ude80"}})" "\n" +
         R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"\u4f60\u597d\nworld \ud83d\ude80"}]}})" "\n" +
         R"({"type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call-1","arguments":"{\"cmd\":\"echo hello\"}"}})" "\n" +
         R"({"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"hello\n"}})" "\n" +
@@ -186,7 +187,7 @@ TEST(LoadsCodexSessionsByProjectAndDecodesMessagesAndTools) {
             EXPECT_TRUE(file.content.find("compact\nsummary") != std::string::npos);
             EXPECT_TRUE(file.content.find("readable summary") != std::string::npos);
             EXPECT_TRUE(file.content.find("opaque-secret-ciphertext") == std::string::npos);
-            EXPECT_TRUE(file.content.find("duplicate event") == std::string::npos);
+            EXPECT_TRUE(file.content.find("## user_message") == std::string::npos);
         } else {
             EXPECT_TRUE(file.content.find("legacy event-only reply") != std::string::npos);
         }
@@ -248,4 +249,106 @@ TEST(OversizedSessionRecordsProduceVisibleWarning) {
     project_describer::AppendCodexSessions(result, project, codex);
     EXPECT_TRUE(result.text_files.empty());
     EXPECT_EQ(result.warnings.size(), std::size_t{1});
+}
+
+TEST(CodexFallbackNamesRespectConfigurationOrderAndIgnoreComments) {
+    ScopedContextDirectory temp;
+    const auto project = temp.path() / "project";
+    const auto codex = temp.path() / "codex";
+    std::filesystem::create_directories(project / ".git");
+    WriteContext(codex / "config.toml",
+        "# project_doc_fallback_filenames = ['IGNORED.md']\n"
+        "project_doc_fallback_filenames = [\n'Z.md', # 'COMMENT.md'\n'A.md']\n");
+    WriteContext(project / "Z.md", "first configured fallback");
+    WriteContext(project / "A.md", "second configured fallback");
+    WriteContext(project / "IGNORED.md", "commented configuration");
+    WriteContext(project / "COMMENT.md", "commented name");
+    const auto result = project_describer::ContextLoader::LoadCodex(project, codex);
+    EXPECT_TRUE(HasContent(result, "first configured fallback"));
+    EXPECT_TRUE(!HasContent(result, "second configured fallback"));
+    EXPECT_TRUE(!HasContent(result, "commented configuration"));
+    EXPECT_TRUE(!HasContent(result, "commented name"));
+}
+
+TEST(CodexRejectsFallbackPathsOutsideTheInstructionDirectory) {
+    ScopedContextDirectory temp;
+    const auto project = temp.path() / "project";
+    const auto codex = temp.path() / "codex";
+    std::filesystem::create_directories(project / ".git");
+    WriteContext(codex / "config.toml", "project_doc_fallback_filenames = ['../outside.md']\n");
+    WriteContext(temp.path() / "outside.md", "outside instruction scope");
+    const auto result = project_describer::ContextLoader::LoadCodex(project, codex);
+    EXPECT_TRUE(!HasContent(result, "outside instruction scope"));
+}
+
+TEST(ClaudeImportsNestedInstructionsAndBoundsContextFiles) {
+    ScopedContextDirectory temp;
+    const auto project = temp.path() / "project";
+    const auto claude = temp.path() / "claude";
+    WriteContext(project / "nested" / ".claude" / "CLAUDE.md", "@guide.md\n");
+    WriteContext(project / "nested" / ".claude" / "guide.md", "nested imported guide");
+    WriteContext(project / "nested" / ".claude" / "settings.json", "{\"nested\":true}");
+    WriteContext(project / "CLAUDE.md", "@large.md\n");
+    WriteContext(project / "large.md", std::string(4 * 1024 * 1024 + 1, 'x'));
+    WriteContext(project / ".claude" / ".credentials.json", "credential must stay excluded");
+    WriteContext(project / ".claude" / "cache" / "cached.txt", "cache must stay excluded");
+    const auto result = project_describer::ContextLoader::LoadClaudeCode(
+        project, claude, temp.path() / "managed");
+    EXPECT_TRUE(HasContent(result, "nested imported guide"));
+    EXPECT_TRUE(HasContent(result, "{\"nested\":true}"));
+    EXPECT_TRUE(!HasContent(result, "credential must stay excluded"));
+    EXPECT_TRUE(!HasContent(result, "cache must stay excluded"));
+    EXPECT_TRUE(!result.warnings.empty());
+}
+
+TEST(CodexKeepsEventMessagesForRolesMissingResponseItems) {
+    ScopedContextDirectory temp;
+    const auto project = temp.path() / "project";
+    const auto codex = temp.path() / "codex";
+    std::filesystem::create_directories(project);
+    WriteContext(codex / "sessions" / "mixed.jsonl", CodexMetadata(project, "mixed") +
+        R"({"type":"event_msg","payload":{"type":"user_message","message":"earlier question"}})" "\n" +
+        R"({"type":"event_msg","payload":{"type":"user_message","message":"question"}})" "\n" +
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question"}]}})" "\n" +
+        R"({"type":"event_msg","payload":{"type":"user_message","message":"question"}})" "\n" +
+        R"({"type":"event_msg","payload":{"type":"agent_message","message":"answer only in event"}})" "\n");
+    project_describer::ScanResult result;
+    project_describer::AppendCodexSessions(result, project, codex);
+    EXPECT_EQ(result.text_files.size(), std::size_t{1});
+    if (!result.text_files.empty()) {
+        EXPECT_TRUE(result.text_files.front().content.find("answer only in event") != std::string::npos);
+        EXPECT_TRUE(result.text_files.front().content.find("earlier question") != std::string::npos);
+        const auto& text = result.text_files.front().content;
+        const auto first = text.find("## user_message");
+        EXPECT_TRUE(first != std::string::npos && text.find("## user_message", first + 1) != std::string::npos);
+    }
+}
+
+TEST(DeeplyNestedSessionJsonProducesAWarningInsteadOfUnboundedRecursion) {
+    ScopedContextDirectory temp;
+    const auto project = temp.path() / "project";
+    const auto codex = temp.path() / "codex";
+    std::filesystem::create_directories(project);
+    WriteContext(codex / "sessions" / "nested.jsonl", CodexMetadata(project, "nested") +
+        "{\"type\":\"unknown\",\"payload\":" + std::string(512, '[') + "0" +
+        std::string(512, ']') + "}\n");
+    project_describer::ScanResult result;
+    project_describer::AppendCodexSessions(result, project, codex);
+    EXPECT_TRUE(result.text_files.empty());
+    EXPECT_TRUE(!result.warnings.empty());
+}
+
+TEST(SessionDisplayNamesRemainUniqueAfterSanitization) {
+    ScopedContextDirectory temp;
+    const auto project = temp.path() / "project";
+    const auto codex = temp.path() / "codex";
+    std::filesystem::create_directories(project);
+    WriteContext(codex / "sessions" / "first.jsonl", CodexMetadata(project, "a/b"));
+    WriteContext(codex / "sessions" / "second.jsonl", CodexMetadata(project, "a:b"));
+    project_describer::ScanResult result;
+    project_describer::AppendCodexSessions(result, project, codex);
+    EXPECT_EQ(result.text_files.size(), std::size_t{2});
+    if (result.text_files.size() == 2) {
+        EXPECT_TRUE(result.text_files[0].relative_path != result.text_files[1].relative_path);
+    }
 }

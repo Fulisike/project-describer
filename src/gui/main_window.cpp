@@ -14,7 +14,6 @@
 #include <QtCore/QHash>
 #include <QtGui/QStandardItem>
 #include <QtGui/QIntValidator>
-#include <QtWidgets/QApplication>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QHeaderView>
@@ -26,6 +25,7 @@
 #include "core/report_writer.hpp"
 #include "model/text_encoding.hpp"
 #include "utils/logging.hpp"
+#include "utils/path_utils.hpp"
 
 namespace project_describer::gui {
 namespace {
@@ -47,9 +47,16 @@ QString PathToQString(const std::filesystem::path& value) {
 }
 
 int LineCount(const std::string& content) {
-    const auto newlines = static_cast<int>(
-        std::count(content.begin(), content.end(), '\n'));
-    return content.empty() ? 0 : (content.back() == '\n' ? newlines : newlines + 1);
+    int lines = 0;
+    for (std::size_t index = 0; index < content.size(); ++index) {
+        if (content[index] == '\r' || content[index] == '\n') {
+            ++lines;
+            if (content[index] == '\r' && index + 1 < content.size() &&
+                content[index + 1] == '\n') ++index;
+        }
+    }
+    return content.empty() ? 0 :
+        ((content.back() == '\r' || content.back() == '\n') ? lines : lines + 1);
 }
 
 void AppendScan(ScanResult& destination, ScanResult source) {
@@ -87,8 +94,8 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 MainWindow::~MainWindow() {
-    if (load_thread_ != nullptr) {
-        load_thread_->wait();
+    if (worker_thread_ != nullptr) {
+        worker_thread_->wait();
     }
     LOG_INFO("GUI window destroyed");
 }
@@ -221,6 +228,16 @@ void MainWindow::SetupUI() {
     }
 
     setCentralWidget(central);
+    const auto invalidate = [this] {
+        loaded_project_path_.clear();
+        start_btn_->setEnabled(false);
+        status_label_->setText("加载条件已更改，请重新加载文件树。");
+    };
+    connect(project_path_edit_, &QLineEdit::textChanged, this, invalidate);
+    connect(output_path_edit_, &QLineEdit::textChanged, this, invalidate);
+    for (auto* checkbox : {project_files_check_, codex_context_check_, claude_context_check_}) {
+        connect(checkbox, &QCheckBox::toggled, this, invalidate);
+    }
 }
 
 void MainWindow::OnBrowseProject() {
@@ -281,14 +298,16 @@ void MainWindow::OnLoad() {
     const bool include_claude = claude_context_check_->isChecked();
     struct LoadState {
         ScanResult scan;
+        std::size_t project_files = 0;
         std::exception_ptr error;
     };
     const auto state = std::make_shared<LoadState>();
-    load_thread_ = QThread::create([state, project_root, output_dir,
+    worker_thread_ = QThread::create([state, project_root, output_dir,
                                    include_project, include_codex, include_claude] {
         try {
             if (include_project) {
                 AppendScan(state->scan, Scanner::Scan(project_root, output_dir));
+                state->project_files = state->scan.text_files.size();
             }
             if (include_codex) {
                 AppendScan(state->scan, ContextLoader::LoadCodex(project_root));
@@ -300,14 +319,15 @@ void MainWindow::OnLoad() {
             state->error = std::current_exception();
         }
     });
-    load_thread_->setParent(this);
-    connect(load_thread_, &QThread::finished, this, [this, state, project_path] {
-        load_thread_ = nullptr;
+    worker_thread_->setParent(this);
+    connect(worker_thread_, &QThread::finished, this, [this, state, project_path] {
+        worker_thread_ = nullptr;
         try {
             if (state->error) {
                 std::rethrow_exception(state->error);
             }
             loaded_scan_ = std::move(state->scan);
+            loaded_project_file_count_ = state->project_files;
             loaded_project_path_ = project_path;
             PopulateTree();
             start_btn_->setEnabled(!loaded_scan_.text_files.empty());
@@ -337,8 +357,8 @@ void MainWindow::OnLoad() {
         }
         SetBusy(false);
     });
-    connect(load_thread_, &QThread::finished, load_thread_, &QObject::deleteLater);
-    load_thread_->start();
+    connect(worker_thread_, &QThread::finished, worker_thread_, &QObject::deleteLater);
+    worker_thread_->start();
 }
 
 void MainWindow::PopulateTree() {
@@ -371,8 +391,7 @@ void MainWindow::PopulateTree() {
 
         QStandardItem* parent = tree_model_->invisibleRootItem();
         QString directory_key;
-        const auto first = components.front().string();
-        if (first != "Codex" && first != "Claude Code") {
+        if (index < loaded_project_file_count_) {
             directory_key = "项目文件";
             parent = find_or_add_child(parent, "项目文件", directory_key);
         }
@@ -497,44 +516,62 @@ void MainWindow::OnStart() {
 
     SetBusy(true);
     status_label_->setText("正在生成 describer 文本…");
-    QApplication::processEvents();
-
-    try {
-        ScanResult selected;
-        selected.scanned_files = selected_indices.size();
-        selected.warnings = loaded_scan_.warnings;
-        std::set<std::string> added_entries;
-        for (const auto index : selected_indices) {
-            if (index >= loaded_scan_.text_files.size()) {
-                continue;
+    const auto project_root = PathFromQString(project_path_edit_->text());
+    struct ExportState {
+        std::filesystem::path output_path;
+        std::size_t file_count = 0;
+        std::exception_ptr error;
+    };
+    const auto state = std::make_shared<ExportState>();
+    worker_thread_ = QThread::create([this, state, selected_indices, project_root,
+                                      output_dir, max_lines_per_file] {
+        try {
+            ScanResult selected;
+            selected.scanned_files = selected_indices.size();
+            selected.warnings = loaded_scan_.warnings;
+            std::set<std::string> added_entries;
+            for (const auto index : selected_indices) {
+                if (index >= loaded_scan_.text_files.size()) {
+                    continue;
+                }
+                selected.text_files.push_back(loaded_scan_.text_files[index]);
+                AddSelectedEntry(selected, loaded_scan_.text_files[index].relative_path,
+                                 added_entries);
             }
-            selected.text_files.push_back(loaded_scan_.text_files[index]);
-            AddSelectedEntry(selected, loaded_scan_.text_files[index].relative_path,
-                             added_entries);
+
+            const auto report = ReportWriter::Render(project_root, selected, max_lines_per_file);
+            const auto output_path = ReportWriter::ChooseOutputPath(output_dir);
+            std::string write_error;
+            if (!ReportWriter::WriteUtf8(output_path, report, write_error)) {
+                throw std::runtime_error(write_error);
+            }
+            state->output_path = output_path;
+            state->file_count = selected.text_files.size();
+        } catch (...) {
+            state->error = std::current_exception();
         }
-
-        const auto project_root = PathFromQString(project_path_edit_->text());
-        const auto report = ReportWriter::Render(project_root, selected, max_lines_per_file);
-        const auto output_path = ReportWriter::ChooseOutputPath(output_dir);
-        std::string write_error;
-        if (!ReportWriter::WriteUtf8(output_path, report, write_error)) {
-            throw std::runtime_error(write_error);
+    });
+    worker_thread_->setParent(this);
+    connect(worker_thread_, &QThread::finished, this, [this, state] {
+        worker_thread_ = nullptr;
+        try {
+            if (state->error) std::rethrow_exception(state->error);
+            preview_edit_->setPlainText(
+                QString("已导出 %1 个文件。\n%2")
+                    .arg(static_cast<qulonglong>(state->file_count))
+                    .arg(PathToQString(state->output_path)));
+            status_label_->setText("导出完成。");
+            LOG_INFO("Exported {} selected files to {}", state->file_count,
+                     PathToUtf8(state->output_path));
+        } catch (const std::exception& e) {
+            LOG_ERROR("Export failed: {}", e.what());
+            status_label_->setText("导出失败，请查看日志。");
+            QMessageBox::critical(this, "导出失败", QString::fromUtf8(e.what()));
         }
-
-        preview_edit_->setPlainText(
-            QString("已导出 %1 个文件。\n%2")
-                .arg(static_cast<qulonglong>(selected.text_files.size()))
-                .arg(PathToQString(output_path)));
-        status_label_->setText("导出完成。");
-        LOG_INFO("Exported {} selected files to {}", selected.text_files.size(),
-                 output_path.string());
-    } catch (const std::exception& e) {
-        LOG_ERROR("Export failed: {}", e.what());
-        status_label_->setText("导出失败，请查看日志。");
-        QMessageBox::critical(this, "导出失败", QString::fromUtf8(e.what()));
-    }
-
-    SetBusy(false);
+        SetBusy(false);
+    });
+    connect(worker_thread_, &QThread::finished, worker_thread_, &QObject::deleteLater);
+    worker_thread_->start();
 }
 
 void MainWindow::SetBusy(bool busy) {

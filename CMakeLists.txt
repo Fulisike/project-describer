@@ -48,6 +48,9 @@ target_link_libraries(project_describer_core
 find_package(Threads REQUIRED)
 target_link_libraries(project_describer_core PUBLIC Threads::Threads)
 target_compile_features(project_describer_core PUBLIC cxx_std_20)
+if(WIN32)
+    target_compile_definitions(project_describer_core PUBLIC SPDLOG_WCHAR_FILENAMES)
+endif()
 
 if(MSVC)
     target_compile_options(project_describer_core PRIVATE /W4 /permissive- PUBLIC /utf-8)
@@ -60,6 +63,9 @@ endif()
 # ===========================================================================
 add_executable(project-describer src/main.cpp)
 target_link_libraries(project-describer PRIVATE project_describer_core)
+if(MINGW)
+    target_link_options(project-describer PRIVATE -municode)
+endif()
 
 # ===========================================================================
 # Tests (optional)
@@ -71,6 +77,7 @@ if(BUILD_TESTING AND PROJECT_DESCRIBER_BUILD_TESTS)
         tests/test_command_line.cpp
         tests/test_context_loader.cpp
         tests/test_encoding.cpp
+        tests/test_logging.cpp
         tests/test_scanner.cpp
         tests/test_report_writer.cpp
     )
@@ -78,6 +85,7 @@ if(BUILD_TESTING AND PROJECT_DESCRIBER_BUILD_TESTS)
     add_test(NAME project-describer-tests COMMAND project-describer-tests)
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-temp")
     set_tests_properties(project-describer-tests PROPERTIES
+        TIMEOUT 60
         ENVIRONMENT "TEMP=${CMAKE_BINARY_DIR}/test-temp;TMP=${CMAKE_BINARY_DIR}/test-temp")
 
     add_executable(project-describer-scan-benchmark EXCLUDE_FROM_ALL
@@ -92,8 +100,8 @@ endif()
 set(PROJECT_DESCRIBER_BUILD_GUI ON CACHE BOOL "Build the Qt6 GUI application")
 
 if(PROJECT_DESCRIBER_BUILD_GUI)
-    set(Qt6_DIR "D:/Qt6/6.9.1/msvc2022_64/lib/cmake/Qt6" CACHE PATH "Qt6 cmake package directory" FORCE)
-    find_package(Qt6 REQUIRED COMPONENTS Widgets)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets
+        HINTS "D:/Qt6/6.9.1/msvc2022_64/lib/cmake/Qt6")
 
     # --- windeployqt: auto-deploy Qt DLLs after each build ---
     set(_qt_bin_dir "${Qt6_DIR}/../../../bin")
@@ -134,8 +142,18 @@ if(PROJECT_DESCRIBER_BUILD_GUI)
         target_link_libraries(project-describer-gui-tests PRIVATE
             project_describer_core Qt6::Widgets)
         add_dependencies(project-describer-gui-tests project-describer-gui)
+        if(WIN32 AND TARGET Qt6::QOffscreenIntegrationPlugin)
+            add_custom_command(TARGET project-describer-gui-tests POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E make_directory
+                    "$<TARGET_FILE_DIR:project-describer-gui-tests>/platforms"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "$<TARGET_FILE:Qt6::QOffscreenIntegrationPlugin>"
+                    "$<TARGET_FILE_DIR:project-describer-gui-tests>/platforms/"
+                VERBATIM)
+        endif()
         add_test(NAME project-describer-gui-tests COMMAND project-describer-gui-tests)
         set_tests_properties(project-describer-gui-tests PROPERTIES
+            TIMEOUT 60
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;TEMP=${CMAKE_BINARY_DIR}/test-temp;TMP=${CMAKE_BINARY_DIR}/test-temp")
     endif()
 

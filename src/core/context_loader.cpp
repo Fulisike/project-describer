@@ -6,15 +6,16 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 #include "utils/file_reader.hpp"
 #include "utils/logging.hpp"
+#include "utils/path_utils.hpp"
 #include "core/session_loader.hpp"
 
 namespace project_describer {
@@ -68,7 +69,7 @@ std::filesystem::path EnvironmentPath(const wchar_t* name,
     if (_wdupenv_s(&value, &length, name) == 0 && value != nullptr) {
         const std::filesystem::path path(value);
         std::free(value);
-        return path;
+        return path.empty() ? fallback : path;
     }
     return fallback;
 }
@@ -120,6 +121,10 @@ void AddEntryPath(ScanResult& result, const std::filesystem::path& relative_path
 
 bool AddFile(ScanResult& result, const std::filesystem::path& source,
              const std::filesystem::path& display_path) {
+    const auto name = PathToUtf8(source.filename());
+    if (name == "auth.json" || name == ".credentials.json" || name == "credentials.json") {
+        return false;
+    }
     const auto duplicate = std::find_if(
         result.text_files.begin(), result.text_files.end(), [&](const FileItem& file) {
             return file.relative_path == display_path;
@@ -128,20 +133,21 @@ bool AddFile(ScanResult& result, const std::filesystem::path& source,
         return true;
     }
     std::error_code error;
-    if (!std::filesystem::is_regular_file(source, error) || error) {
+    if (IsPathLink(source) || IsPathLink(source.parent_path()) ||
+        !std::filesystem::is_regular_file(source, error) || error) {
         return false;
     }
     const auto size = std::filesystem::file_size(source, error);
     if (error || size > kMaxContextFileSize) {
         result.warnings.push_back("Skipped context file (too large or unreadable): " +
-                                  source.string());
+                                  PathToUtf8(source));
         return false;
     }
 
-    const auto read = FileReader::ReadTextFile(source);
+    const auto read = FileReader::ReadTextFile(source, kMaxContextFileSize);
     ++result.scanned_files;
     if (!read.success) {
-        result.warnings.push_back("Skipped context file: " + source.string() +
+        result.warnings.push_back("Skipped context file: " + PathToUtf8(source) +
                                   " (" + read.error_message + ")");
         return false;
     }
@@ -156,7 +162,7 @@ template <typename Predicate>
 void AddDirectory(ScanResult& result, const std::filesystem::path& source_root,
                   const std::filesystem::path& display_root, Predicate include) {
     std::error_code error;
-    if (!std::filesystem::is_directory(source_root, error) || error) {
+    if (IsPathLink(source_root) || !std::filesystem::is_directory(source_root, error) || error) {
         return;
     }
 
@@ -164,6 +170,13 @@ void AddDirectory(ScanResult& result, const std::filesystem::path& source_root,
         source_root, std::filesystem::directory_options::skip_permission_denied, error);
     const std::filesystem::recursive_directory_iterator end;
     for (; !error && it != end; it.increment(error)) {
+        const auto name = PathToUtf8(it->path().filename());
+        if (IsPathLink(it->path()) || name == "cache" || name == "caches" ||
+            name == ".cache" || name == "logs" || name == "auth.json" ||
+            name == ".credentials.json" || name == "credentials.json") {
+            it.disable_recursion_pending();
+            continue;
+        }
         if (!it->is_regular_file(error) || error || !include(it->path())) {
             error.clear();
             continue;
@@ -172,7 +185,7 @@ void AddDirectory(ScanResult& result, const std::filesystem::path& source_root,
     }
     if (error) {
         result.warnings.push_back("Could not completely scan context directory: " +
-                                  source_root.string() + " (" + error.message() + ")");
+                                  PathToUtf8(source_root) + " (" + ErrorToUtf8(error) + ")");
     }
 }
 
@@ -180,48 +193,99 @@ bool IsContextText(const std::filesystem::path& path) {
     static const std::set<std::string> kBinaryExtensions = {
         ".db", ".db-shm", ".db-wal", ".sqlite", ".sqlite3", ".lock", ".log",
         ".png", ".jpg", ".jpeg", ".gif", ".ico", ".zip", ".gz", ".pdf"};
-    auto extension = path.extension().string();
+    auto extension = PathToUtf8(path.extension());
     std::transform(extension.begin(), extension.end(), extension.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return kBinaryExtensions.count(extension) == 0;
 }
 
-std::set<std::string> CodexFallbackNames(const std::filesystem::path& config_path) {
-    std::set<std::string> names;
-    const auto read = FileReader::ReadTextFile(config_path);
+std::vector<std::string> CodexFallbackNames(const std::filesystem::path& config_path) {
+    std::vector<std::string> names;
+    const auto read = FileReader::ReadTextFile(config_path, kMaxContextFileSize);
     if (!read.success) {
         return names;
     }
-    const std::regex assignment(
-        R"(project_doc_fallback_filenames\s*=\s*\[([^\]]*)\])",
-        std::regex::icase);
-    std::smatch match;
-    if (!std::regex_search(read.text.utf8, match, assignment)) {
-        return names;
+    // Remove TOML comments without stripping '#' inside quoted filenames.
+    std::string config;
+    char quote = 0;
+    bool escaped = false;
+    bool comment = false;
+    for (const char ch : read.text.utf8) {
+        if (comment && ch != '\n') continue;
+        if (ch == '\n') comment = false;
+        if (!quote && ch == '#') { comment = true; continue; }
+        config += ch;
+        if (escaped) { escaped = false; continue; }
+        if (quote == '"' && ch == '\\') { escaped = true; continue; }
+        if (quote && ch == quote) quote = 0;
+        else if (!quote && (ch == '"' || ch == '\'')) quote = ch;
     }
-    const std::regex quoted(R"xx(["']([^"']+)["'])xx");
-    const std::string values = match[1].str();
-    for (std::sregex_iterator it(values.begin(), values.end(), quoted), end;
-         it != end; ++it) {
-        names.insert((*it)[1].str());
+    constexpr std::string_view key = "project_doc_fallback_filenames";
+    std::size_t cursor = 0;
+    bool found = false;
+    while (cursor < config.size()) {
+        const auto end = config.find('\n', cursor);
+        const auto start = config.find_first_not_of(" \t\r", cursor);
+        if (start != std::string::npos && (end == std::string::npos || start < end)) {
+            if (config[start] == '[') break;  // Only the top-level TOML setting applies.
+            if (config.compare(start, key.size(), key) == 0) {
+                cursor = config.find_first_not_of(" \t", start + key.size());
+                if (cursor == std::string::npos || config[cursor] != '=') break;
+                cursor = config.find_first_not_of(" \t\r\n", cursor + 1);
+                if (cursor == std::string::npos || config[cursor] != '[') break;
+                ++cursor;
+                found = true;
+                break;
+            }
+        }
+        if (end == std::string::npos) break;
+        cursor = end + 1;
+    }
+    if (!found) return names;
+    while (cursor < config.size()) {
+        cursor = config.find_first_not_of(" \t\r\n,", cursor);
+        if (cursor == std::string::npos || config[cursor] == ']') break;
+        const auto start = cursor++;
+        const char delimiter = config[start];
+        if (delimiter != '\'' && delimiter != '"') break;
+        while (cursor < config.size() && config[cursor] != delimiter) {
+            if (delimiter == '"' && config[cursor] == '\\') ++cursor;
+            ++cursor;
+        }
+        if (cursor >= config.size()) break;
+        std::string name;
+        if (delimiter == '"') {
+            const auto value = nlohmann::json::parse(config.substr(start, cursor - start + 1), nullptr, false);
+            if (!value.is_string()) break;
+            name = value.get<std::string>();
+        } else {
+            name = config.substr(start + 1, cursor - start - 1);
+        }
+        ++cursor;
+        const auto path = Utf8Path(name);
+        if (!name.empty() && name != "." && name != ".." &&
+            name.find_first_of("/\\:\0", 0, 4) == std::string::npos &&
+            !path.has_parent_path()) {
+            names.push_back(name);
+        }
     }
     return names;
 }
 
 std::optional<std::filesystem::path> FirstCodexInstruction(
-    const std::filesystem::path& directory, const std::set<std::string>& fallback_names) {
+    const std::filesystem::path& directory, const std::vector<std::string>& fallback_names) {
     const std::vector<std::string> primary = {"AGENTS.override.md", "AGENTS.md"};
     for (const auto& name : primary) {
         const auto candidate = directory / name;
         std::error_code error;
-        if (std::filesystem::is_regular_file(candidate, error) && !error) {
+        if (!IsPathLink(candidate) && std::filesystem::is_regular_file(candidate, error) && !error) {
             return candidate;
         }
     }
     for (const auto& name : fallback_names) {
-        const auto candidate = directory / name;
+        const auto candidate = directory / Utf8Path(name);
         std::error_code error;
-        if (std::filesystem::is_regular_file(candidate, error) && !error) {
+        if (!IsPathLink(candidate) && std::filesystem::is_regular_file(candidate, error) && !error) {
             return candidate;
         }
     }
@@ -247,7 +311,7 @@ std::filesystem::path DisplayAbsolutePath(const std::filesystem::path& prefix,
                                           const std::filesystem::path& absolute_path) {
     std::filesystem::path result = prefix;
     if (!absolute_path.root_name().empty()) {
-        std::string drive = absolute_path.root_name().string();
+        std::string drive = PathToUtf8(absolute_path.root_name());
         drive.erase(std::remove(drive.begin(), drive.end(), ':'), drive.end());
         if (!drive.empty()) {
             result /= drive;
@@ -263,35 +327,58 @@ std::vector<std::filesystem::path> ClaudeImports(const std::string& content,
                                                   const std::filesystem::path& source,
                                                   const std::filesystem::path& home) {
     std::vector<std::filesystem::path> paths;
-    const std::regex import_pattern(R"((?:^|[\s(])@([^\s`<>]+))",
-                                    std::regex::ECMAScript);
     std::istringstream lines(content);
     std::string line;
-    bool in_fenced_code = false;
+    char fence = 0;
+    std::size_t fence_width = 0;
     while (std::getline(lines, line)) {
         const auto first = line.find_first_not_of(" \t");
-        if (first != std::string::npos &&
-            (line.compare(first, 3, "```") == 0 || line.compare(first, 3, "~~~") == 0)) {
-            in_fenced_code = !in_fenced_code;
-            continue;
+        if (first != std::string::npos && (line[first] == '`' || line[first] == '~')) {
+            const auto end = line.find_first_not_of(line[first], first);
+            const auto width = (end == std::string::npos ? line.size() : end) - first;
+            if (width >= 3) {
+                if (fence == 0) {
+                    fence = line[first];
+                    fence_width = width;
+                } else if (fence == line[first] && width >= fence_width &&
+                           (end == std::string::npos || line.find_first_not_of(" \t\r", end) == std::string::npos)) {
+                    fence = 0;
+                }
+                continue;
+            }
         }
-        if (in_fenced_code) {
+        if (fence != 0) {
             continue;
         }
 
-        bool in_inline_code = false;
-        for (char& ch : line) {
-            if (ch == '`') {
-                in_inline_code = !in_inline_code;
-                ch = ' ';
-            } else if (in_inline_code) {
-                ch = ' ';
+        for (std::size_t cursor = 0; cursor < line.size();) {
+            const auto start = line.find('`', cursor);
+            if (start == std::string::npos) break;
+            auto end = line.find_first_not_of('`', start);
+            if (end == std::string::npos) break;
+            const auto width = end - start;
+            cursor = end;
+            while ((end = line.find('`', end)) != std::string::npos) {
+                const auto next = line.find_first_not_of('`', end);
+                const auto stop = next == std::string::npos ? line.size() : next;
+                if (stop - end == width) {
+                    std::fill(line.begin() + start, line.begin() + stop, ' ');
+                    cursor = stop;
+                    break;
+                }
+                end = stop;
             }
         }
 
-        for (std::sregex_iterator it(line.begin(), line.end(), import_pattern), end;
-             it != end; ++it) {
-            std::string value = (*it)[1].str();
+        for (std::size_t cursor = 0; cursor < line.size();) {
+            const auto at = line.find('@', cursor);
+            if (at == std::string::npos) break;
+            cursor = at + 1;
+            if (at != 0 && line[at - 1] != '(' &&
+                !std::isspace(static_cast<unsigned char>(line[at - 1]))) continue;
+            const auto end = line.find_first_of(" \t\r\n\v\f`<>", cursor);
+            std::string value = line.substr(cursor, end == std::string::npos ? end : end - cursor);
+            cursor = end == std::string::npos ? line.size() : end;
             while (!value.empty() &&
                    (value.back() == ',' || value.back() == '.' || value.back() == ')' ||
                     value.back() == ']' || value.back() == ';' || value.back() == ':')) {
@@ -327,15 +414,13 @@ void AddClaudeFileAndImports(ScanResult& result, const std::filesystem::path& so
     if (!visited.insert(key).second) {
         return;
     }
-    const auto read = FileReader::ReadTextFile(source);
-    if (!read.success) {
-        AddFile(result, source, display_path);
-        return;
-    }
     if (!AddFile(result, source, display_path) || depth >= 4) {
         return;
     }
-    for (const auto& imported : ClaudeImports(read.text.utf8, source, home)) {
+    const auto file = std::find_if(result.text_files.begin(), result.text_files.end(),
+        [&](const FileItem& item) { return item.relative_path == display_path; });
+    const auto imports = ClaudeImports(file->content, source, home);
+    for (const auto& imported : imports) {
         AddClaudeFileAndImports(
             result, imported,
             DisplayAbsolutePath(std::filesystem::path("Claude Code") / "Imports", imported),
@@ -344,7 +429,7 @@ void AddClaudeFileAndImports(ScanResult& result, const std::filesystem::path& so
 }
 
 std::string ClaudeProjectKey(const std::filesystem::path& project_root) {
-    auto value = std::filesystem::absolute(project_root).lexically_normal().string();
+    auto value = PathToUtf8(std::filesystem::absolute(project_root).lexically_normal());
     for (char& ch : value) {
         if (ch == ':' || ch == '/' || ch == '\\') {
             ch = '-';
@@ -382,7 +467,7 @@ ScanResult ContextLoader::LoadCodex(const std::filesystem::path& project_root,
     for (std::filesystem::directory_iterator it(codex_home, profile_error), end;
          !profile_error && it != end; it.increment(profile_error)) {
         if (it->is_regular_file(profile_error) && !profile_error &&
-            it->path().filename().string().ends_with(".config.toml")) {
+            PathToUtf8(it->path().filename()).ends_with(".config.toml")) {
             AddFile(result, it->path(),
                     std::filesystem::path("Codex") / "Global" / it->path().filename());
         }
@@ -421,8 +506,12 @@ ScanResult ContextLoader::LoadCodex(const std::filesystem::path& project_root,
     };
     add_directory_context(repository_root);
     for (; !error && it != end; it.increment(error)) {
+        if (IsPathLink(it->path())) {
+            it.disable_recursion_pending();
+            continue;
+        }
         if (it->is_directory(error) && !error) {
-            const auto name = it->path().filename().string();
+            const auto name = PathToUtf8(it->path().filename());
             if (name == ".git" || name == "node_modules" || name == "build" ||
                 name == "dist" || name == ".venv") {
                 it.disable_recursion_pending();
@@ -434,7 +523,7 @@ ScanResult ContextLoader::LoadCodex(const std::filesystem::path& project_root,
     }
     if (error) {
         result.warnings.push_back("Could not completely scan Codex project context: " +
-                                  error.message());
+                                  ErrorToUtf8(error));
     }
     GroupSharedContext(result);
     AppendCodexSessions(result, project_root, codex_home);
@@ -464,11 +553,13 @@ ScanResult ContextLoader::LoadClaudeCode(const std::filesystem::path& project_ro
     const auto home = HomeDirectory();
     std::set<std::string> imported;
 
-    AddClaudeFileAndImports(result, managed_root / "CLAUDE.md",
-                            std::filesystem::path("Claude Code") / "Managed" / "CLAUDE.md",
-                            home, 0, imported);
-    AddFile(result, managed_root / "managed-settings.json",
-            std::filesystem::path("Claude Code") / "Managed" / "managed-settings.json");
+    if (!managed_root.empty()) {
+        AddClaudeFileAndImports(result, managed_root / "CLAUDE.md",
+                                std::filesystem::path("Claude Code") / "Managed" / "CLAUDE.md",
+                                home, 0, imported);
+        AddFile(result, managed_root / "managed-settings.json",
+                std::filesystem::path("Claude Code") / "Managed" / "managed-settings.json");
+    }
 
     AddClaudeFileAndImports(result, claude_home / "CLAUDE.md",
                             std::filesystem::path("Claude Code") / "Global" / "CLAUDE.md",
@@ -494,7 +585,7 @@ ScanResult ContextLoader::LoadClaudeCode(const std::filesystem::path& project_ro
     auto add_project_file = [&](const std::filesystem::path& path) {
         const auto display = std::filesystem::path("Claude Code") / "Project" /
                              path.lexically_relative(project_root);
-        const auto filename = path.filename().string();
+        const auto filename = PathToUtf8(path.filename());
         if (filename == "CLAUDE.md" || filename == "CLAUDE.local.md" ||
             filename == "AGENTS.md") {
             AddClaudeFileAndImports(result, path, display, home, 0, imported);
@@ -506,33 +597,47 @@ ScanResult ContextLoader::LoadClaudeCode(const std::filesystem::path& project_ro
                              ".worktreeinclude"}) {
         add_project_file(project_root / name);
     }
-    AddClaudeFileAndImports(
-        result, project_root / ".claude" / "CLAUDE.md",
-        std::filesystem::path("Claude Code") / "Project" / ".claude" / "CLAUDE.md",
-        home, 0, imported);
+    if (!IsPathLink(project_root / ".claude")) {
+        AddClaudeFileAndImports(
+            result, project_root / ".claude" / "CLAUDE.md",
+            std::filesystem::path("Claude Code") / "Project" / ".claude" / "CLAUDE.md",
+            home, 0, imported);
+    }
     AddDirectory(result, project_root / ".claude",
                  std::filesystem::path("Claude Code") / "Project" / ".claude",
                  IsContextText);
 
     for (; !error && it != end; it.increment(error)) {
         const auto path = it->path();
+        if (IsPathLink(path)) {
+            it.disable_recursion_pending();
+            continue;
+        }
         if (it->is_directory(error) && !error) {
-            const auto name = path.filename().string();
+            const auto name = PathToUtf8(path.filename());
             if (name == ".git" || name == "node_modules" || name == "build" ||
-                name == "dist" || name == ".venv" || name == ".claude") {
+                name == "dist" || name == ".venv") {
+                it.disable_recursion_pending();
+            } else if (name == ".claude") {
+                AddClaudeFileAndImports(result, path / "CLAUDE.md",
+                    std::filesystem::path("Claude Code") / "Project" /
+                        (path / "CLAUDE.md").lexically_relative(project_root), home, 0, imported);
+                AddDirectory(result, path,
+                    std::filesystem::path("Claude Code") / "Project" /
+                        path.lexically_relative(project_root), IsContextText);
                 it.disable_recursion_pending();
             }
             continue;
         }
         error.clear();
-        const auto name = path.filename().string();
+        const auto name = PathToUtf8(path.filename());
         if (name == "CLAUDE.md" || name == "CLAUDE.local.md" || name == "AGENTS.md") {
             add_project_file(path);
         }
     }
     if (error) {
         result.warnings.push_back("Could not completely scan Claude project context: " +
-                                  error.message());
+                                  ErrorToUtf8(error));
     }
     GroupSharedContext(result);
     AppendClaudeSessions(result, project_root, claude_home);

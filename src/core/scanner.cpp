@@ -14,13 +14,9 @@
 #include <string_view>
 #include <thread>
 
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#endif
-
 #include "utils/file_reader.hpp"
 #include "utils/logging.hpp"
+#include "utils/path_utils.hpp"
 
 namespace project_describer {
 namespace {
@@ -31,7 +27,12 @@ bool ShouldSkipDirectory(const std::filesystem::path& dir) {
         ".idea", ".vscode", ".gradle", "build", "out", "dist",
         "cmake-build-debug", "cmake-build-release", ".cache", ".pytest_cache",
         ".clangd"};
-    return kSkippedDirs.count(dir.filename().string()) > 0;
+    auto name = PathToUtf8(dir.filename());
+#ifdef _WIN32
+    std::transform(name.begin(), name.end(), name.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+#endif
+    return kSkippedDirs.count(name) > 0;
 }
 
 bool HasBinaryExtension(const std::filesystem::path& path) {
@@ -45,13 +46,20 @@ bool HasBinaryExtension(const std::filesystem::path& path) {
         ".pdf", ".ttf", ".otf", ".woff", ".woff2", ".eot",
         ".class", ".jar", ".war", ".pyc", ".pyo",
         ".pak", ".assets", ".dylib", ".dSYM", ".swp", ".swo"};
-    return kBinaryExts.count(path.extension().string()) > 0;
+    auto extension = PathToUtf8(path.extension());
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return kBinaryExts.count(extension) > 0;
 }
 
 bool IsGeneratedReport(const std::filesystem::path& path,
                        const std::filesystem::path& output_directory,
                        const std::filesystem::path& canonical_output) {
-    const auto name = path.filename().string();
+    auto name = PathToUtf8(path.filename());
+#ifdef _WIN32
+    std::transform(name.begin(), name.end(), name.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+#endif
     constexpr std::string_view prefix = "describer";
     constexpr std::string_view suffix = ".txt";
     if (!name.starts_with(prefix) || !name.ends_with(suffix)) {
@@ -79,17 +87,6 @@ bool IsGeneratedReport(const std::filesystem::path& path,
     return !error && _wcsicmp(parent.c_str(), canonical_output.c_str()) == 0;
 #else
     return !error && parent == canonical_output;
-#endif
-}
-
-bool IsLinkedDirectory(const std::filesystem::path& path) {
-#ifdef _WIN32
-    const auto attributes = GetFileAttributesW(path.c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES &&
-           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-#else
-    std::error_code error;
-    return std::filesystem::is_symlink(path, error);
 #endif
 }
 
@@ -158,7 +155,7 @@ private:
             buffer.text_files.emplace_back(std::move(job.relative),
                 read.text.source_encoding, std::move(read.text.utf8));
         } else if (read.error_message != "Binary or non-text content") {
-            const auto warning = "Skipped " + job.source.filename().string() +
+            const auto warning = "Skipped " + PathToUtf8(job.source.filename()) +
                                  ": " + read.error_message;
             LOG_WARN("{}", warning);
             buffer.warnings.push_back(warning);
@@ -212,7 +209,7 @@ private:
 ScanResult Scanner::Scan(const std::filesystem::path& project_root,
                          const std::filesystem::path& output_directory,
                          const ScannerConfig& config) {
-    LOG_INFO("Scanning project: {}", project_root.string());
+    LOG_INFO("Scanning project: {}", PathToUtf8(project_root));
 
     ScanResult result;
     std::error_code ec;
@@ -220,7 +217,7 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
     try {
         // Validate project root
         if (!std::filesystem::is_directory(project_root, ec) || ec) {
-            const auto msg = "Project root is not a directory: " + project_root.string();
+            const auto msg = "Project root is not a directory: " + PathToUtf8(project_root);
             LOG_ERROR("{}", msg);
             result.warnings.push_back(msg);
             return result;
@@ -232,7 +229,7 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
             std::filesystem::directory_options::skip_permission_denied,
             ec);
         if (ec) {
-            const auto msg = "Cannot start directory traversal: " + ec.message();
+            const auto msg = "Cannot start directory traversal: " + ErrorToUtf8(ec);
             LOG_ERROR("{}", msg);
             result.warnings.push_back(msg);
             return result;
@@ -250,7 +247,7 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
             const auto relative = path.lexically_relative(project_root);
             const bool is_directory = entry.is_directory(ec);
             if (ec) {
-                result.warnings.push_back("Cannot inspect entry: " + path.string());
+                result.warnings.push_back("Cannot inspect entry: " + PathToUtf8(path));
                 ec.clear();
                 it.disable_recursion_pending();
                 continue;
@@ -269,21 +266,21 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
             }
 
             if (is_directory) {
-                if (ShouldSkipDirectory(path) || IsLinkedDirectory(path)) {
+                if (ShouldSkipDirectory(path) || IsPathLink(path)) {
                     it.disable_recursion_pending();
-                    LOG_DEBUG("Skipping directory: {}", path.string());
+                    LOG_DEBUG("Skipping directory: {}", PathToUtf8(path));
                 }
                 continue;
             }
 
             ++result.scanned_files;
             // Never read special files or follow file links outside the selected tree.
-            if (entry.is_symlink(ec) || !entry.is_regular_file(ec) || ec) {
+            if (IsPathLink(path) || !entry.is_regular_file(ec) || ec) {
                 ec.clear();
                 continue;
             }
             // Skip dotfiles and known binary extensions
-            const auto filename = path.filename().string();
+            const auto filename = PathToUtf8(path.filename());
             if (!filename.empty() && filename.front() == '.') {
                 continue;
             }
@@ -295,28 +292,28 @@ ScanResult Scanner::Scan(const std::filesystem::path& project_root,
             std::error_code size_ec;
             const auto size = entry.file_size(size_ec);
             if (size_ec) {
-                LOG_WARN("Cannot read file size: {}", path.string());
+                LOG_WARN("Cannot read file size: {}", PathToUtf8(path));
+                result.warnings.push_back("Cannot read file size: " + PathToUtf8(relative));
                 continue;
             }
             if (size > config.max_file_size) {
                 LOG_WARN("Skipping large file ({} > {} bytes): {}",
-                         size, config.max_file_size, path.string());
+                         size, config.max_file_size, PathToUtf8(path));
                 result.warnings.push_back("Skipping large file: " +
-                                          path.filename().string());
+                                          PathToUtf8(path.filename()));
                 continue;
             }
 
             readers.Add({path, relative});
         }
         if (ec) {
-            result.warnings.push_back("Traversal aborted: " + ec.message());
+            result.warnings.push_back("Traversal aborted: " + ErrorToUtf8(ec));
         }
         readers.Finish(result);
 
         std::sort(result.entries.begin(), result.entries.end(),
                   [](const ProjectEntry& left, const ProjectEntry& right) {
-                      return left.relative_path.generic_u8string() <
-                             right.relative_path.generic_u8string();
+                      return left.relative_path < right.relative_path;
                   });
         std::sort(result.text_files.begin(), result.text_files.end(),
                   [](const FileItem& left, const FileItem& right) {
