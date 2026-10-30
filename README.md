@@ -55,12 +55,26 @@ Run `project-describer --help` for the command summary.
 
 ## GUI file selection and AI context
 
+The project and output directories are remembered separately when the GUI closes,
+including manually entered paths. Each defaults to the executable's directory until
+it has a saved value. Clearing a field does not overwrite its last saved directory.
+On Windows, these preferences are stored in the registry at
+`HKEY_CURRENT_USER\Software\ProjectDescriber\Project Describer\paths`
+(`project` and `output` values). The GUI log, `describer.log`, is next to the executable;
+reports go to the output directory selected in the window.
+
 The GUI separates loading from exporting:
 
 1. Choose a project and one or more sources: project files, Codex context, or
    Claude Code context.
 2. Click **Load / Refresh** and expand or collapse the resulting hierarchy.
 3. Check only the files that should be included, then click **Export selected files**.
+
+The lower area has two resizable panes. The left shows the selected file's full
+content; selecting a folder or clearing the selection shows a prompt instead.
+The right previews the complete report for the checked files, including the line
+limit below. Preview generation runs in the background, and export writes that
+same report. Loading and export results appear in the status line; hover for details.
 
 The **每个文件前 N 行** field limits each selected file's exported content to its
 first N lines. Empty lines count as lines; files shorter than N lines are included
@@ -73,13 +87,17 @@ instructions and settings; rules, skills, commands, agents, output styles, proje
 auto-memory, and recursive `@path` imports. These appear under **Shared context**.
 
 Local conversation transcripts appear under **Sessions**, grouped by local
-profile, provider (Codex), selected project, and session ID. Each session is one
+profile, provider (Codex), original project path, and session ID. All locally saved
+projects are included, independently of the project directory selected for scanning.
+Claude subagent transcripts appear under their parent session's **Subagents** folder.
+Each session is one
 readable Markdown document. Select a leaf to preview its decoded messages, tool
 calls/results, and recorded compaction information before choosing what to export.
 Codex reads `CODEX_HOME/sessions` and `archived_sessions`; Claude Code reads
 `CLAUDE_CONFIG_DIR/projects`, with their usual home-directory defaults.
-Project matching uses transcript `cwd` metadata, including custom Claude project
-folder names. Authentication files, logs, and caches are excluded.
+Project grouping uses transcript `cwd` metadata, including custom Claude project
+folder names and projects that have since moved or been deleted. Authentication
+files, logs, and caches are excluded.
 
 Account/authentication identity is displayed as unknown because local transcripts
 do not reliably record it. A readable transcript is not an exact reconstruction of

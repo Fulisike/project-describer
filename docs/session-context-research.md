@@ -41,16 +41,18 @@ Codex or Claude Code
 └── Sessions
     └── Local profile (auth unknown)
         └── Provider - openai       [Codex only; a provider is not an account]
-            └── selected-project
-                └── session-id.md
+            └── original-project-path
+                ├── session-id.md
+                └── session-id/Subagents/agent-id.md  [Claude Code]
 ```
 
-Only transcripts whose metadata cwd matches the selected directory are loaded.
-The matcher normalizes paths and handles Windows ASCII case differences; it does
-not infer the project solely from Claude's lossy folder name. Session IDs deduplicate
-copies across active/archive locations. Each readable document identifies its
-source path and local profile. Claude subagent directories are excluded from the
-parent-session list.
+All saved local projects are loaded independently of the selected scanning directory.
+Grouping uses the recorded cwd path, including its parent components, so projects
+with the same basename stay separate and moved or deleted projects remain available.
+The loader does not infer the project solely from Claude's lossy folder name.
+Session IDs deduplicate copies across active/archive locations. Each readable
+document identifies its source path and local profile. Claude subagent transcripts
+are grouped under their parent session and deduplicated by parent session and agent ID.
 
 Messages decode JSON escapes, Unicode, surrogate pairs, and embedded tool argument
 JSON. Tool IDs are retained to associate calls and results. Codex event messages
@@ -82,8 +84,11 @@ are shared context, not proof of their historical contents in a past session.
 Compressed archive files, referenced parent-history reconstruction, and cloud-only
 sessions are outside this initial JSONL implementation.
 
-Validation covers project filtering, custom Claude folder names, session-ID
+Validation covers discovery across projects, same-name project grouping, custom
+Claude folder names, subagent transcripts, session-ID
 deduplication, archives, old event-only Codex records, tool calls/results, Unicode
 and line escapes, compaction, incomplete records, and oversized records. A Qt test
 target additionally exercises background loading, tree leaves, decoded preview,
-and selection-based export; it can be built with `project-describer-gui-tests`.
+and selection-based export. Separate file and export previews are checked for empty
+selection, checkbox changes, line limits, and equality with the written report.
+The GUI tests can be built with `project-describer-gui-tests`.

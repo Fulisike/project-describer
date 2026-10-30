@@ -10,8 +10,10 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
 #include <QtCore/QHash>
+#include <QtCore/QSettings>
 #include <QtGui/QStandardItem>
 #include <QtGui/QIntValidator>
 #include <QtWidgets/QFileDialog>
@@ -19,6 +21,7 @@
 #include <QtWidgets/QHeaderView>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QMessageBox>
+#include <QtWidgets/QSplitter>
 #include <QtWidgets/QVBoxLayout>
 
 #include "core/context_loader.hpp"
@@ -87,8 +90,12 @@ void AddSelectedEntry(ScanResult& result, const std::filesystem::path& path,
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent) {
     SetupUI();
-    project_path_edit_->setText(QDir::currentPath());
-    output_path_edit_->setText(QDir::currentPath());
+    QSettings settings;
+    const auto default_path = QCoreApplication::applicationDirPath();
+    project_path_edit_->setText(QDir::toNativeSeparators(
+        settings.value("paths/project", default_path).toString()));
+    output_path_edit_->setText(QDir::toNativeSeparators(
+        settings.value("paths/output", default_path).toString()));
     status_label_->setText("请选择上下文来源，然后加载文件树。");
     LOG_INFO("GUI window created");
 }
@@ -96,6 +103,18 @@ MainWindow::MainWindow(QWidget* parent)
 MainWindow::~MainWindow() {
     if (worker_thread_ != nullptr) {
         worker_thread_->wait();
+    }
+    if (preview_thread_ != nullptr) {
+        preview_thread_->wait();
+    }
+    QSettings settings;
+    const auto project_path = project_path_edit_->text().trimmed();
+    const auto output_path = output_path_edit_->text().trimmed();
+    if (!project_path.isEmpty()) {
+        settings.setValue("paths/project", QDir::toNativeSeparators(QDir(project_path).absolutePath()));
+    }
+    if (!output_path.isEmpty()) {
+        settings.setValue("paths/output", QDir::toNativeSeparators(QDir(output_path).absolutePath()));
     }
     LOG_INFO("GUI window destroyed");
 }
@@ -179,20 +198,34 @@ void MainWindow::SetupUI() {
         layout->addWidget(tree_view_, 3);
     }
     {
-        preview_edit_ = new QTextEdit(central);
-        preview_edit_->setReadOnly(true);
-        preview_edit_->setPlaceholderText("加载和导出结果会显示在这里。");
-        preview_edit_->setMaximumHeight(150);
-        layout->addWidget(preview_edit_, 1);
+        auto* splitter = new QSplitter(Qt::Horizontal, central);
+        splitter->setObjectName("preview_splitter");
+        auto* file_pane = new QWidget(splitter);
+        auto* file_layout = new QVBoxLayout(file_pane);
+        file_layout->setContentsMargins(0, 0, 0, 0);
+        file_layout->addWidget(new QLabel("当前文件预览", file_pane));
+        file_preview_edit_ = new QPlainTextEdit(file_pane);
+        file_preview_edit_->setObjectName("file_preview");
+        file_preview_edit_->setReadOnly(true);
+        file_preview_edit_->setPlaceholderText("请从上方列表中选择一个文件。");
+        file_layout->addWidget(file_preview_edit_);
+        auto* export_pane = new QWidget(splitter);
+        auto* export_layout = new QVBoxLayout(export_pane);
+        export_layout->setContentsMargins(0, 0, 0, 0);
+        export_layout->addWidget(new QLabel("导出内容预览", export_pane));
+        export_preview_edit_ = new QPlainTextEdit(export_pane);
+        export_preview_edit_->setObjectName("export_preview");
+        export_preview_edit_->setReadOnly(true);
+        export_preview_edit_->setPlaceholderText("请先加载文件树，再勾选需要导出的文件。");
+        export_layout->addWidget(export_preview_edit_);
+        splitter->setStretchFactor(0, 1);
+        splitter->setStretchFactor(1, 1);
+        splitter->setMaximumHeight(200);
+        layout->addWidget(splitter, 1);
         connect(tree_view_->selectionModel(), &QItemSelectionModel::currentChanged,
-                this, [this](const QModelIndex& current) {
-            const auto index = current.data(kFileIndexRole);
-            if (index.isValid() && index.toULongLong() < loaded_scan_.text_files.size()) {
-                const auto& file = loaded_scan_.text_files[static_cast<std::size_t>(index.toULongLong())];
-                preview_edit_->setPlainText(QString::fromUtf8(file.content.data(),
-                    static_cast<qsizetype>(file.content.size())));
-            }
-        });
+                this, &MainWindow::UpdateFilePreview);
+        connect(tree_view_->selectionModel(), &QItemSelectionModel::selectionChanged,
+                this, &MainWindow::UpdateFilePreview);
     }
     {
         auto* row = new QHBoxLayout;
@@ -228,9 +261,15 @@ void MainWindow::SetupUI() {
     }
 
     setCentralWidget(central);
+    preview_timer_ = new QTimer(this);
+    preview_timer_->setSingleShot(true);
+    preview_timer_->setInterval(120);
+    connect(preview_timer_, &QTimer::timeout, this, &MainWindow::UpdateExportPreview);
+    connect(file_line_limit_edit_, &QLineEdit::textChanged, this, &MainWindow::ScheduleExportPreview);
     const auto invalidate = [this] {
         loaded_project_path_.clear();
-        start_btn_->setEnabled(false);
+        tree_view_->selectionModel()->clear();
+        ScheduleExportPreview();
         status_label_->setText("加载条件已更改，请重新加载文件树。");
     };
     connect(project_path_edit_, &QLineEdit::textChanged, this, invalidate);
@@ -290,6 +329,9 @@ void MainWindow::OnLoad() {
     }
 
     SetBusy(true);
+    loaded_project_path_.clear();
+    tree_view_->selectionModel()->clear();
+    ScheduleExportPreview();
     status_label_->setText("正在加载文件树…");
     const auto project_path = QDir::cleanPath(project_path_edit_->text());
     const auto output_dir = PathFromQString(output_path_edit_->text());
@@ -330,7 +372,7 @@ void MainWindow::OnLoad() {
             loaded_project_file_count_ = state->project_files;
             loaded_project_path_ = project_path;
             PopulateTree();
-            start_btn_->setEnabled(!loaded_scan_.text_files.empty());
+            ScheduleExportPreview();
 
             std::ostringstream summary;
             summary << "Loaded " << loaded_scan_.text_files.size()
@@ -344,9 +386,13 @@ void MainWindow::OnLoad() {
                     LOG_WARN("{}", warning);
                 }
             }
-            preview_edit_->setPlainText(QString::fromStdString(summary.str()));
+            status_label_->setToolTip(QString::fromStdString(summary.str()));
             status_label_->setText(QString("已加载 %1 个可选文件。").arg(
                 static_cast<qulonglong>(loaded_scan_.text_files.size())));
+            if (!loaded_scan_.warnings.empty()) {
+                status_label_->setText(status_label_->text() + QString(" %1 条警告，详情见提示和日志。")
+                    .arg(static_cast<qulonglong>(loaded_scan_.warnings.size())));
+            }
             LOG_INFO("Loaded {} selectable files", loaded_scan_.text_files.size());
         } catch (const std::exception& e) {
             LOG_ERROR("Context load failed: {}", e.what());
@@ -456,6 +502,7 @@ void MainWindow::OnTreeItemChanged(QStandardItem* item) {
         }
     }
     updating_checks_ = false;
+    ScheduleExportPreview();
 }
 
 void MainWindow::SetAllChecked(Qt::CheckState state) {
@@ -469,6 +516,113 @@ void MainWindow::SetAllChecked(Qt::CheckState state) {
     };
     set_state(tree_model_->invisibleRootItem());
     updating_checks_ = false;
+    ScheduleExportPreview();
+}
+
+void MainWindow::UpdateFilePreview() {
+    file_preview_edit_->clear();
+    const auto index = tree_view_->currentIndex().data(kFileIndexRole);
+    if (tree_view_->selectionModel()->hasSelection() && index.isValid() &&
+        index.toULongLong() < loaded_scan_.text_files.size()) {
+        const auto& file = loaded_scan_.text_files[static_cast<std::size_t>(index.toULongLong())];
+        file_preview_edit_->setPlainText(QString::fromUtf8(file.content.data(),
+            static_cast<qsizetype>(file.content.size())));
+    }
+}
+
+ScanResult MainWindow::SelectedScan() const {
+    ScanResult selected;
+    selected.warnings = loaded_scan_.warnings;
+    std::set<std::string> added_entries;
+    std::function<void(QStandardItem*)> collect = [&](QStandardItem* parent) {
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            auto* child = parent->child(row);
+            const auto value = child->data(kFileIndexRole);
+            if (value.isValid() && child->checkState() == Qt::Checked) {
+                const auto& file = loaded_scan_.text_files[static_cast<std::size_t>(value.toULongLong())];
+                selected.text_files.push_back(file);
+                AddSelectedEntry(selected, file.relative_path, added_entries);
+            }
+            collect(child);
+        }
+    };
+    collect(tree_model_->invisibleRootItem());
+    selected.scanned_files = selected.text_files.size();
+    return selected;
+}
+
+void MainWindow::ScheduleExportPreview() {
+    ++preview_revision_;
+    export_report_.reset();
+    start_btn_->setEnabled(false);
+    export_preview_edit_->clear();
+    preview_timer_->stop();
+    if (loaded_project_path_.isEmpty()) {
+        export_preview_edit_->setPlaceholderText("请先加载文件树，再勾选需要导出的文件。");
+        return;
+    }
+    export_preview_edit_->setPlaceholderText("正在生成导出预览…");
+    preview_timer_->start();
+}
+
+void MainWindow::UpdateExportPreview() {
+    if (preview_thread_ != nullptr || loaded_project_path_.isEmpty()) {
+        return;
+    }
+    std::size_t max_lines = 0;
+    const auto line_limit = file_line_limit_edit_->text().trimmed();
+    if (!line_limit.isEmpty()) {
+        bool valid = false;
+        const auto lines = line_limit.toInt(&valid);
+        if (!valid || lines < 1) {
+            export_preview_edit_->setPlaceholderText("请输入正整数行数，或选择“默认（全文）”。");
+            return;
+        }
+        max_lines = static_cast<std::size_t>(lines);
+    }
+    auto selected = SelectedScan();
+    if (selected.text_files.empty()) {
+        export_preview_edit_->setPlaceholderText("请从上方列表中勾选需要导出的文件。");
+        return;
+    }
+    const auto project_root = PathFromQString(loaded_project_path_);
+    const auto revision = preview_revision_;
+    struct PreviewState {
+        std::shared_ptr<const std::string> report;
+        std::size_t file_count;
+        std::exception_ptr error;
+    };
+    const auto state = std::make_shared<PreviewState>();
+    state->file_count = selected.text_files.size();
+    preview_thread_ = QThread::create([state, project_root, max_lines, selected = std::move(selected)] {
+        try {
+            state->report = std::make_shared<const std::string>(
+                ReportWriter::Render(project_root, selected, max_lines));
+        } catch (...) {
+            state->error = std::current_exception();
+        }
+    });
+    preview_thread_->setParent(this);
+    connect(preview_thread_, &QThread::finished, this, [this, state, revision] {
+        preview_thread_ = nullptr;
+        if (revision != preview_revision_) {
+            if (!loaded_project_path_.isEmpty()) preview_timer_->start();
+            return;
+        }
+        try {
+            if (state->error) std::rethrow_exception(state->error);
+            export_report_ = state->report;
+            export_file_count_ = state->file_count;
+            export_preview_edit_->setPlainText(QString::fromUtf8(
+                export_report_->data(), static_cast<qsizetype>(export_report_->size())));
+            start_btn_->setEnabled(worker_thread_ == nullptr);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Export preview failed: {}", e.what());
+            export_preview_edit_->setPlaceholderText("导出预览生成失败，请查看日志。");
+        }
+    });
+    connect(preview_thread_, &QThread::finished, preview_thread_, &QObject::deleteLater);
+    preview_thread_->start();
 }
 
 void MainWindow::OnStart() {
@@ -478,32 +632,7 @@ void MainWindow::OnStart() {
         return;
     }
 
-    std::size_t max_lines_per_file = 0;
-    const auto line_limit = file_line_limit_edit_->text().trimmed();
-    if (!line_limit.isEmpty()) {
-        bool valid = false;
-        const int lines = line_limit.toInt(&valid);
-        if (!valid || lines < 1) {
-            QMessageBox::warning(this, "无效行数", "请输入正整数，或选择“默认（全文）”。");
-            return;
-        }
-        max_lines_per_file = static_cast<std::size_t>(lines);
-    }
-
-    std::vector<std::size_t> selected_indices;
-    std::function<void(QStandardItem*)> collect = [&](QStandardItem* parent) {
-        for (int row = 0; row < parent->rowCount(); ++row) {
-            auto* child = parent->child(row);
-            const auto value = child->data(kFileIndexRole);
-            if (value.isValid() && child->checkState() == Qt::Checked) {
-                selected_indices.push_back(static_cast<std::size_t>(value.toULongLong()));
-            }
-            collect(child);
-        }
-    };
-    collect(tree_model_->invisibleRootItem());
-    if (selected_indices.empty()) {
-        QMessageBox::warning(this, "未选择文件", "请至少勾选一个要导出的文件。");
+    if (!export_report_) {
         return;
     }
 
@@ -515,38 +644,23 @@ void MainWindow::OnStart() {
     }
 
     SetBusy(true);
-    status_label_->setText("正在生成 describer 文本…");
-    const auto project_root = PathFromQString(project_path_edit_->text());
+    status_label_->setText("正在导出 describer 文本…");
     struct ExportState {
         std::filesystem::path output_path;
         std::size_t file_count = 0;
         std::exception_ptr error;
     };
     const auto state = std::make_shared<ExportState>();
-    worker_thread_ = QThread::create([this, state, selected_indices, project_root,
-                                      output_dir, max_lines_per_file] {
+    state->file_count = export_file_count_;
+    const auto report = export_report_;
+    worker_thread_ = QThread::create([state, report, output_dir] {
         try {
-            ScanResult selected;
-            selected.scanned_files = selected_indices.size();
-            selected.warnings = loaded_scan_.warnings;
-            std::set<std::string> added_entries;
-            for (const auto index : selected_indices) {
-                if (index >= loaded_scan_.text_files.size()) {
-                    continue;
-                }
-                selected.text_files.push_back(loaded_scan_.text_files[index]);
-                AddSelectedEntry(selected, loaded_scan_.text_files[index].relative_path,
-                                 added_entries);
-            }
-
-            const auto report = ReportWriter::Render(project_root, selected, max_lines_per_file);
             const auto output_path = ReportWriter::ChooseOutputPath(output_dir);
             std::string write_error;
-            if (!ReportWriter::WriteUtf8(output_path, report, write_error)) {
+            if (!ReportWriter::WriteUtf8(output_path, *report, write_error)) {
                 throw std::runtime_error(write_error);
             }
             state->output_path = output_path;
-            state->file_count = selected.text_files.size();
         } catch (...) {
             state->error = std::current_exception();
         }
@@ -556,11 +670,11 @@ void MainWindow::OnStart() {
         worker_thread_ = nullptr;
         try {
             if (state->error) std::rethrow_exception(state->error);
-            preview_edit_->setPlainText(
-                QString("已导出 %1 个文件。\n%2")
+            status_label_->setText(
+                QString("已导出 %1 个文件：%2")
                     .arg(static_cast<qulonglong>(state->file_count))
-                    .arg(PathToQString(state->output_path)));
-            status_label_->setText("导出完成。");
+                    .arg(PathToQString(state->output_path.filename())));
+            status_label_->setToolTip(PathToQString(state->output_path));
             LOG_INFO("Exported {} selected files to {}", state->file_count,
                      PathToUtf8(state->output_path));
         } catch (const std::exception& e) {
@@ -576,8 +690,7 @@ void MainWindow::OnStart() {
 
 void MainWindow::SetBusy(bool busy) {
     load_btn_->setEnabled(!busy);
-    start_btn_->setEnabled(!busy && !loaded_project_path_.isEmpty() &&
-                           !loaded_scan_.text_files.empty());
+    start_btn_->setEnabled(!busy && !loaded_project_path_.isEmpty() && export_report_ != nullptr);
     browse_project_btn_->setEnabled(!busy);
     browse_output_btn_->setEnabled(!busy);
     project_path_edit_->setEnabled(!busy);

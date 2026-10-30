@@ -1,7 +1,6 @@
 #include "core/session_loader.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <fstream>
 #include <iterator>
 #include <set>
@@ -42,21 +41,6 @@ std::filesystem::path Utf8Path(std::string_view text) {
 std::string PathText(const std::filesystem::path& path) {
     const auto text = path.generic_u8string();
     return {text.begin(), text.end()};
-}
-
-std::string PathKey(const std::filesystem::path& path) {
-    std::error_code error;
-    auto normalized = std::filesystem::weakly_canonical(path, error);
-    if (error) {
-        normalized = std::filesystem::absolute(path).lexically_normal();
-    }
-    auto key = PathText(normalized);
-#ifdef _WIN32
-    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-#endif
-    return key;
 }
 
 bool IsLink(const std::filesystem::path& path) {
@@ -251,7 +235,10 @@ void AppendSession(ScanResult& result, const std::filesystem::path& source,
     if (id.empty()) {
         id = String(metadata, "session_id");
     }
-    if (id.empty() || seen.count(id) != 0) {
+    const bool subagent = !codex && source.parent_path().filename() == "subagents";
+    const auto agent_id = subagent ? PathText(source.stem()) : std::string{};
+    const auto key = subagent ? id + "/subagents/" + agent_id : id;
+    if (id.empty() || seen.count(key) != 0) {
         return;
     }
     std::ifstream input(source, std::ios::binary | std::ios::ate);
@@ -267,6 +254,9 @@ void AppendSession(ScanResult& result, const std::filesystem::path& source,
         "\nSource: " + PathText(source) +
         "\nAccount / authentication: unknown (not recorded reliably in this transcript).\n"
         "\nThis is a readable local transcript, not an exact reconstruction of the current model context.\n";
+    if (subagent) {
+        text += "\nSubagent: " + agent_id + "\n";
+    }
     std::string line;
     std::size_t malformed = 0;
     std::multiset<std::pair<std::string, std::string>> response_messages;
@@ -340,15 +330,25 @@ void AppendSession(ScanResult& result, const std::filesystem::path& source,
     if (codex) {
         display /= Utf8Path("Provider - " + SafeName(String(metadata, "model_provider")));
     }
-    display /= project.filename().empty() ? std::filesystem::path("Project") : project.filename();
-    display /= Utf8Path(SafeName(id) + ".md");
+    for (const auto& component : project.lexically_normal()) {
+        const auto name = PathText(component);
+        if (name != "/" && name != "\\") {
+            display /= Utf8Path(SafeName(name));
+        }
+    }
+    if (subagent) {
+        display /= Utf8Path(SafeName(id));
+        display /= "Subagents";
+    }
+    const auto document_id = subagent ? agent_id : id;
+    display /= Utf8Path(SafeName(document_id) + ".md");
     const auto directory = display.parent_path();
     for (std::size_t suffix = 1; std::any_of(result.text_files.begin(), result.text_files.end(),
              [&](const FileItem& file) { return file.relative_path == display; }); ++suffix) {
-        display = directory / Utf8Path(SafeName(id) + "-" + std::to_string(suffix) + ".md");
+        display = directory / Utf8Path(SafeName(document_id) + "-" + std::to_string(suffix) + ".md");
     }
     result.text_files.emplace_back(display, TextEncoding::kUtf8, std::move(text));
-    seen.insert(id);
+    seen.insert(key);
     std::filesystem::path current;
     for (auto part = display.begin(); part != display.end(); ++part) {
         current /= *part;
@@ -361,9 +361,7 @@ void AppendSession(ScanResult& result, const std::filesystem::path& source,
     ++result.scanned_files;
 }
 
-void AppendSessions(ScanResult& result, const std::filesystem::path& project,
-                    const std::filesystem::path& home, bool codex) {
-    const auto project_key = PathKey(project);
+void AppendSessions(ScanResult& result, const std::filesystem::path& home, bool codex) {
     std::set<std::string> seen;
     for (const auto* directory : codex ? std::vector<const char*>{"sessions", "archived_sessions"}
                                       : std::vector<const char*>{"projects"}) {
@@ -382,10 +380,12 @@ void AppendSessions(ScanResult& result, const std::filesystem::path& project,
                 continue;
             }
             if (it->is_directory(error)) {
-                if (!codex && it.depth() >= 1) {
-                    // Parent session transcripts are directly under each project directory.
+                if (!codex && (it.depth() >= 3 ||
+                    (it.depth() == 2 && path.filename() != "subagents") ||
+                    (it.depth() == 1 && !std::filesystem::is_directory(path / "subagents", error)))) {
                     it.disable_recursion_pending();
                 }
+                error.clear();
             } else if (!error && path.extension() == ".jsonl" && it->is_regular_file(error)) {
                 candidates.push_back(path);
             }
@@ -401,8 +401,8 @@ void AppendSessions(ScanResult& result, const std::filesystem::path& project,
                 if (cwd.empty()) {
                     result.warnings.push_back("Session has no recognizable project metadata: " + PathText(source));
                 }
-                if (!cwd.empty() && PathKey(Utf8Path(cwd)) == project_key) {
-                    AppendSession(result, source, home, project, metadata, codex, seen);
+                if (!cwd.empty()) {
+                    AppendSession(result, source, home, Utf8Path(cwd), metadata, codex, seen);
                 }
             } catch (const std::exception& error) {
                 result.warnings.push_back("Skipped session: " + PathText(source) +
@@ -414,14 +414,12 @@ void AppendSessions(ScanResult& result, const std::filesystem::path& project,
 
 }  // namespace
 
-void AppendCodexSessions(ScanResult& result, const std::filesystem::path& project_root,
-                         const std::filesystem::path& codex_home) {
-    AppendSessions(result, project_root, codex_home, true);
+void AppendCodexSessions(ScanResult& result, const std::filesystem::path& codex_home) {
+    AppendSessions(result, codex_home, true);
 }
 
-void AppendClaudeSessions(ScanResult& result, const std::filesystem::path& project_root,
-                          const std::filesystem::path& claude_home) {
-    AppendSessions(result, project_root, claude_home, false);
+void AppendClaudeSessions(ScanResult& result, const std::filesystem::path& claude_home) {
+    AppendSessions(result, claude_home, false);
 }
 
 }  // namespace project_describer

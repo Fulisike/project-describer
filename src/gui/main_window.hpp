@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <QtCore/QThread>
+#include <QtCore/QTimer>
 
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QLabel>
@@ -11,7 +12,7 @@
 #include <QtWidgets/QPushButton>
 #include <QtGui/QStandardItemModel>
 #include <QtWidgets/QStatusBar>
-#include <QtWidgets/QTextEdit>
+#include <QtWidgets/QPlainTextEdit>
 #include <QtWidgets/QTreeView>
 
 #include "core/scanner.hpp"
@@ -37,6 +38,10 @@ private:
     void SetBusy(bool busy);
     void PopulateTree();
     void SetAllChecked(Qt::CheckState state);
+    void UpdateFilePreview();
+    void ScheduleExportPreview();
+    void UpdateExportPreview();
+    ScanResult SelectedScan() const;
 
     QLineEdit*       project_path_edit_   = nullptr;
     QLineEdit*       output_path_edit_    = nullptr;
@@ -53,7 +58,9 @@ private:
     QCheckBox*       claude_context_check_= nullptr;
     QTreeView*       tree_view_           = nullptr;
     QStandardItemModel* tree_model_       = nullptr;
-    QTextEdit*       preview_edit_        = nullptr;
+    QPlainTextEdit*  file_preview_edit_   = nullptr;
+    QPlainTextEdit*  export_preview_edit_ = nullptr;
+    QTimer*         preview_timer_       = nullptr;
     QLabel*          status_label_        = nullptr;
     QProgressBar*    progress_bar_        = nullptr;
     ScanResult       loaded_scan_;
@@ -61,6 +68,10 @@ private:
     QString          loaded_project_path_;
     bool             updating_checks_     = false;
     QThread*         worker_thread_         = nullptr;
+    QThread*         preview_thread_        = nullptr;
+    std::size_t      preview_revision_      = 0;
+    std::shared_ptr<const std::string> export_report_;
+    std::size_t      export_file_count_     = 0;
 };
 
 }  // namespace project_describer::gui

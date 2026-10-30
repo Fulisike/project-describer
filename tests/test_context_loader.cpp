@@ -145,7 +145,7 @@ TEST(LoadsClaudeContextAndFollowsImports) {
                                          "settings.json"));
 }
 
-TEST(LoadsCodexSessionsByProjectAndDecodesMessagesAndTools) {
+TEST(LoadsAllCodexSessionsAndDecodesMessagesAndTools) {
     ScopedContextDirectory temp;
     const auto project = temp.path() / std::filesystem::path(u8"中文项目");
     const auto codex = temp.path() / "codex";
@@ -169,12 +169,13 @@ TEST(LoadsCodexSessionsByProjectAndDecodesMessagesAndTools) {
                  CodexMetadata(temp.path() / "other-project", "other-session"));
 
     project_describer::ScanResult result;
-    project_describer::AppendCodexSessions(result, project, codex);
-    EXPECT_EQ(result.text_files.size(), std::size_t{2});
-    EXPECT_EQ(result.scanned_files, std::size_t{2});
+    project_describer::AppendCodexSessions(result, codex);
+    EXPECT_EQ(result.text_files.size(), std::size_t{3});
+    EXPECT_EQ(result.scanned_files, std::size_t{3});
     EXPECT_EQ(result.warnings.size(), std::size_t{1});
     EXPECT_TRUE(HasPathEnding(result, std::filesystem::path(u8"中文项目") / "session-a.md"));
     EXPECT_TRUE(HasPathEnding(result, std::filesystem::path(u8"中文项目") / "session-b.md"));
+    EXPECT_TRUE(HasPathEnding(result, std::filesystem::path("other-project") / "other-session.md"));
     for (const auto& file : result.text_files) {
         EXPECT_TRUE(file.content.find("credential must not be loaded") == std::string::npos);
         if (file.file_name == "session-a.md") {
@@ -188,7 +189,7 @@ TEST(LoadsCodexSessionsByProjectAndDecodesMessagesAndTools) {
             EXPECT_TRUE(file.content.find("readable summary") != std::string::npos);
             EXPECT_TRUE(file.content.find("opaque-secret-ciphertext") == std::string::npos);
             EXPECT_TRUE(file.content.find("## user_message") == std::string::npos);
-        } else {
+        } else if (file.file_name == "session-b.md") {
             EXPECT_TRUE(file.content.find("legacy event-only reply") != std::string::npos);
         }
     }
@@ -213,9 +214,11 @@ TEST(LoadsClaudeSessionsFromMetadataWithCustomProjectFolder) {
         R"(,"sessionId":"other","message":{"role":"user","content":"unrelated"}})" "\n");
     WriteContext(claude / ".credentials.json", "credential must not be loaded");
     project_describer::ScanResult result;
-    project_describer::AppendClaudeSessions(result, project, claude);
-    EXPECT_EQ(result.text_files.size(), std::size_t{1});
+    project_describer::AppendClaudeSessions(result, claude);
+    EXPECT_EQ(result.text_files.size(), std::size_t{3});
     EXPECT_TRUE(result.warnings.empty());
+    EXPECT_TRUE(HasPathEnding(result, std::filesystem::path("claude-a") / "Subagents" / "agent.md"));
+    EXPECT_TRUE(HasPathEnding(result, std::filesystem::path("other") / "other.md"));
     if (!result.text_files.empty()) {
         const auto& text = result.text_files.front().content;
         EXPECT_TRUE(text.find("hello\nClaude") != std::string::npos);
@@ -223,6 +226,24 @@ TEST(LoadsClaudeSessionsFromMetadataWithCustomProjectFolder) {
         EXPECT_TRUE(text.find("file text") != std::string::npos);
         EXPECT_TRUE(text.find("compaction boundary") != std::string::npos);
         EXPECT_TRUE(text.find("unrelated") == std::string::npos);
+    }
+}
+
+TEST(SessionsKeepProjectsWithTheSameNameSeparate) {
+    ScopedContextDirectory temp;
+    const auto codex = temp.path() / "codex";
+    WriteContext(codex / "sessions" / "first.jsonl",
+        CodexMetadata(temp.path() / "one" / "project", "first"));
+    WriteContext(codex / "sessions" / "second.jsonl",
+        CodexMetadata(temp.path() / "two" / "project", "second"));
+    project_describer::ScanResult result;
+    project_describer::AppendCodexSessions(result, codex);
+    EXPECT_EQ(result.text_files.size(), std::size_t{2});
+    EXPECT_TRUE(HasPathEnding(result, std::filesystem::path("one") / "project" / "first.md"));
+    EXPECT_TRUE(HasPathEnding(result, std::filesystem::path("two") / "project" / "second.md"));
+    if (result.text_files.size() == 2) {
+        EXPECT_TRUE(result.text_files[0].relative_path.parent_path() !=
+                    result.text_files[1].relative_path.parent_path());
     }
 }
 
@@ -246,7 +267,7 @@ TEST(OversizedSessionRecordsProduceVisibleWarning) {
     WriteContext(codex / "sessions" / "large.jsonl", CodexMetadata(project, "large") +
         std::string(4 * 1024 * 1024 + 1, 'x') + "\n");
     project_describer::ScanResult result;
-    project_describer::AppendCodexSessions(result, project, codex);
+    project_describer::AppendCodexSessions(result, codex);
     EXPECT_TRUE(result.text_files.empty());
     EXPECT_EQ(result.warnings.size(), std::size_t{1});
 }
@@ -313,7 +334,7 @@ TEST(CodexKeepsEventMessagesForRolesMissingResponseItems) {
         R"({"type":"event_msg","payload":{"type":"user_message","message":"question"}})" "\n" +
         R"({"type":"event_msg","payload":{"type":"agent_message","message":"answer only in event"}})" "\n");
     project_describer::ScanResult result;
-    project_describer::AppendCodexSessions(result, project, codex);
+    project_describer::AppendCodexSessions(result, codex);
     EXPECT_EQ(result.text_files.size(), std::size_t{1});
     if (!result.text_files.empty()) {
         EXPECT_TRUE(result.text_files.front().content.find("answer only in event") != std::string::npos);
@@ -333,7 +354,7 @@ TEST(DeeplyNestedSessionJsonProducesAWarningInsteadOfUnboundedRecursion) {
         "{\"type\":\"unknown\",\"payload\":" + std::string(512, '[') + "0" +
         std::string(512, ']') + "}\n");
     project_describer::ScanResult result;
-    project_describer::AppendCodexSessions(result, project, codex);
+    project_describer::AppendCodexSessions(result, codex);
     EXPECT_TRUE(result.text_files.empty());
     EXPECT_TRUE(!result.warnings.empty());
 }
@@ -346,7 +367,7 @@ TEST(SessionDisplayNamesRemainUniqueAfterSanitization) {
     WriteContext(codex / "sessions" / "first.jsonl", CodexMetadata(project, "a/b"));
     WriteContext(codex / "sessions" / "second.jsonl", CodexMetadata(project, "a:b"));
     project_describer::ScanResult result;
-    project_describer::AppendCodexSessions(result, project, codex);
+    project_describer::AppendCodexSessions(result, codex);
     EXPECT_EQ(result.text_files.size(), std::size_t{2});
     if (result.text_files.size() == 2) {
         EXPECT_TRUE(result.text_files[0].relative_path != result.text_files[1].relative_path);

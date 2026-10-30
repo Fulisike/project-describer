@@ -526,7 +526,7 @@ ScanResult ContextLoader::LoadCodex(const std::filesystem::path& project_root,
                                   ErrorToUtf8(error));
     }
     GroupSharedContext(result);
-    AppendCodexSessions(result, project_root, codex_home);
+    AppendCodexSessions(result, codex_home);
     LOG_INFO("Loaded {} Codex context files", result.text_files.size());
     return result;
 }
@@ -640,7 +640,7 @@ ScanResult ContextLoader::LoadClaudeCode(const std::filesystem::path& project_ro
                                   ErrorToUtf8(error));
     }
     GroupSharedContext(result);
-    AppendClaudeSessions(result, project_root, claude_home);
+    AppendClaudeSessions(result, claude_home);
     LOG_INFO("Loaded {} Claude Code context files", result.text_files.size());
     return result;
 }
